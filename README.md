@@ -61,10 +61,17 @@ conda activate relmind-backend
 cd backend
 pip install -r requirements.txt
 # 复现锁定版本：pip install -r requirements.lock
+# 说明：socketio / requests / jieba 属于核心运行时依赖（已列在 requirements.txt），
+#       缺失会导致后端无法启动或知识库检索静默失效
 
 # 3. 可选：安装 AI 实验室重型依赖（CPU 版示例）
 pip install torch torchaudio tensorflow tf-keras
 pip install -r requirements-ai.txt
+# 未安装时 ASR / 语调情感 / 文本情感 / VLM 会降级，启动日志里会逐条给出原因
+
+# 3.1 构建知识库检索索引（通话时的"参考资料"来自这里）
+python scripts/build_kb_index.py
+# 说明：索引落在 backend/data/kb_index.pkl；未构建时检索返回空，通话静默不带参考资料
 
 # 4. 创建数据库
 mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mindbasic DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
@@ -114,8 +121,13 @@ pytest tests -q
 | `EMAIL_ENABLED` | 否 | false 时验证码打印在后端日志，方便开发联调 |
 | `SMTP_HOST/PORT/USER/PASSWORD/FROM` | 否 | 邮箱发送；QQ/163 用 465（SSL），STARTTLS 服务用 587 |
 | `DEEPSEEK_API_KEY` | 否 | DeepSeek Key，AI 心理教练；未配置时 `/api/ai_coach/chat` 返回 503 |
-| `DIFY_API_BASE` / `DIFY_API_KEY` | 否 | Dify 智能体（视频通话 LLM）；配置 Key 后优先走 Dify（云端 `https://api.dify.ai/v1`，本地 Docker 用 `http://<host>:18080/v1`），未配置回退 DeepSeek |
+| `DIFY_API_BASE` / `DIFY_API_KEY` | 否 | Dify 智能体（视频通话 LLM）；Key 必须是**应用密钥**（`app-` 开头，`dataset-` 开头的是知识库密钥，调不通 `/chat-messages`）。配置后**优先走 Dify**（云端 `https://api.dify.ai/v1`，本地 Docker 用 `http://<host>:18080/v1`），失败时按「单轮回退 + 熔断」降级到 DeepSeek（详见下文「LLM 供应商选择与回退」）。自检：`python scripts/check_dify.py` |
 | `LLM_RETRIES` | 否 | LLM 请求连接失败自动重试次数，默认 3（应对 SSL EOF / 超时等瞬时故障） |
+| `DIFY_CIRCUIT_THRESHOLD` / `DIFY_CIRCUIT_COOLDOWN` | 否 | Dify 熔断阈值：连续失败几轮后跳过 Dify（默认 3 轮）、跳过时长（默认 120 秒）。冷却结束自动再试，任一成功即复位 |
+| `KB_RERANK_ENABLED` | 否 | 知识库检索是否用 DeepSeek 做查询扩展 + 重排，默认 true；设为 false 退回纯 BM25（省两次模型调用） |
+| `KB_RECALL_CANDIDATES` | 否 | BM25 召回的候选条数（交给 DeepSeek 重排），默认 12 |
+| `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` | 否 | 建索引时的切块长度 / 重叠字数，默认 500 / 100（改后需重建索引） |
+| `KB_SOURCE_DIR` / `KB_INDEX_PATH` | 否 | 覆盖语料源目录 / 索引路径（默认位置见「知识库上传与部署指南」） |
 | `SENSEVOICE_DEVICE` | 否 | SenseVoice 设备，留空自动检测（`cuda`/`cpu`） |
 | `DEEPSEEK_BASE_URL/MODEL/TIMEOUT` | 否 | DeepSeek 覆盖项（默认 api.deepseek.com / deepseek-chat / 90s） |
 | `TTS_VOICE` / `TTS_RATE` | 否 | 视频通话语音合成（edge-tts，免费）；默认 `zh-CN-XiaoxiaoNeural` / `+20%` |
@@ -158,18 +170,55 @@ backend/
 │   │   │   ├── realtime_session.py      # 视频通话会话状态
 │   │   │   ├── tts_service.py           # edge-tts 语音合成
 │   │   │   ├── vlm_service.py           # VLM 视觉理解（可选）
+│   │   │   ├── dify_service.py          # Dify 客户端（入参类型自适应 / 熔断）
+│   │   │   ├── kb_service.py            # 知识库检索（jieba + BM25 + DeepSeek 重排）
 │   │   │   └── sensevoice/              # SenseVoice 远程代码
 │   │   └── …                # 业务服务（认证、预约、个案、社群、测评、邮件…）
 │   └── utils/               # 时间、格式化等工具
 ├── scripts/
 │   ├── run_dev.py               # 开发启动（app.main:socket_app）
 │   ├── demo_seed.py             # 演示数据
-│   └── cleanup_orphan_files.py  # 清扫上传孤儿文件（支持 --dry-run）
-├── tests/                  # pytest 集成测试（16 个文件，73 项）
+│   ├── cleanup_orphan_files.py  # 清扫上传孤儿文件（支持 --dry-run）
+│   ├── build_kb_index.py        # 构建知识库检索索引（本地，不调模型 API）
+│   └── check_dify.py            # Dify 接入自检（入参 / 类型 / 一轮完整对话）
+├── data/                   # 知识库索引 kb_index.pkl（构建产物，不入库）
+├── tests/                  # pytest 集成测试（39 个文件，215 项）
+├── experiments/            # 评测脚本与标注数据（消融 / 危机分级 / 校准 / 阶段一致性）
+├── docs/                   # 模型清单与许可证、Dify 工作流改动说明、知识库检索方案与部署指南
 ├── requirements.txt        # 直接依赖
 ├── requirements.lock       # pip-compile 锁定
 └── requirements-ai.txt     # AI 实验室重型依赖（可选）
 ```
+
+## 知识库检索（RAG）
+
+视频通话里「普通心理教练」用的参考资料，来自**平台侧自建的检索**，不依赖 Dify 的知识库。
+原因：账号里只有 DeepSeek（无 embedding 模型），Dify 的语义/混合检索不可用，
+经济模式的关键词检索实测也搜不出内容——连片段自身提取出的关键词都 0 命中。
+详见 [`docs/知识库检索方案.md`](docs/知识库检索方案.md)。
+
+实现：**jieba 分词 + BM25 召回 → DeepSeek 查询扩展与重排**，纯本地计算，零 embedding 调用。
+
+| 项 | 说明 |
+| --- | --- |
+| 语料 | 15 本心理教练 / 心理学书籍（第三方出版物，**不随仓库分发**） |
+| 索引 | `data/kb_index.pkl`，6,992 片段 / 51,969 词条 / 约 17 MB |
+| 构建 | `python scripts/build_kb_index.py`，约 9 秒；书不变只需构建一次 |
+| 运行时 | ASR 后与多模态分析**并发**检索，top-4 拼成 `knowledge_context` 传给 Dify |
+| 索引缺失时 | 静默降级：不报错，只是本轮不带参考资料（启动日志会给出提示） |
+
+```bash
+# 建索引，并顺手验证一次检索
+python scripts/build_kb_index.py --query "一躺下就想工作的事，睡不着"
+```
+
+Dify 侧需要两步：开始节点声明 `knowledge_context` 变量；在「普通心理教练」的
+USER 消息里用变量选择器引用它（`{{#<开始节点id>.knowledge_context#}}`，不要手打裸变量名）。
+完整的「换机器 / Docker 部署 / 增删书籍 / 排障」见
+[`docs/知识库上传与部署指南.md`](docs/知识库上传与部署指南.md)。
+
+> **版权**：语料为第三方出版物，版权归原作者与出版方所有。语料与由其生成的检索索引
+> **均不纳入仓库分发**，仓库只提供索引构建脚本与检索实现；使用者需自备合法来源语料本地构建。
 
 ## 功能模块
 
@@ -204,9 +253,22 @@ backend/
 - 语音转文字：SenseVoice（中文为主，含 emo 标签）
 - 语调情感：emotion2vec+，失败自动降级 OpenSMILE（eGeMAPSv02）
 - 文本情感：mDeBERTa-v3 零样本
-- 多模态融合：文本 + 语调 + 面部时序 → 融合情绪与置信度
+- 多模态融合：文本 + 语调 + 面部时序 → 融合情绪与置信度；启发式动态调权（缺失归零、稳定性减半、置信度降权）
+- 置信度校准：温度缩放（默认关闭），让"置信度"可用于阈值判断；见 `app/services/ai_lab/calibration.py`
+- 线索冲突检测：模态间 JS 散度 → 冲突等级与"是否需要澄清"，把"线索冲突时先提问确认"变成可复核的算法输出
 - AI 心理教练：DeepSeek 对话，自动携带识别上下文（表情/语调/转写/投入度）
 - AI 视频通话：实时语音对话 + edge-tts 语音回复 + 打断；配置 VLM Key 后支持视觉理解
+
+### AI 成长记录（会话留痕闭环）
+
+实时通话过程中的对话、五阶段判定、风险分级与分段耗时都会落库，通话结束后生成阶段总结草稿，
+用户确认后写入情绪日记并与原会话关联。这条链路是"成长记录闭环"的实现，也是成效统计的数据来源。
+
+- 五阶段状态引擎：`app/services/coach_stage_service.py`（平台侧确定性判定，结果回传给 Dify）
+- 会话与消息：`ai_conversations` / `ai_messages`（逐轮记录阶段、风险与耗时）
+- 授权存证：`consent_records`（麦克风 / 摄像头 / 多模态，含协议版本、授权来源与时间）
+- 用户接口：会话列表 / 详情 / 阶段总结草稿 / 确认总结（幂等，直接生成情绪日记）
+- 管理端统计：`GET /api/v1/admin/stats/multimodal`（成功率、降级原因、耗时分位、风险与阶段分布）
 
 ## API 约定
 
@@ -231,6 +293,8 @@ backend/
 | 成长 | `/check-ins` `/check-ins/leaderboard` `/growth-assessments` |
 | 社群 | `/communities` `/communities/{id}/posts` `/communities/{id}/posts/{postId}/comments|like` |
 | 后台 | `/admin/users|coach-audits|articles|banners|tags|feedback-lib|communities|system-configs|stats` |
+| AI 成长记录 | `/ai-conversations` `/ai-conversations/{id}` `/ai-conversations/{id}/summary` `/ai-conversations/{id}/summary/confirm` |
+| AI 留痕统计 | `/admin/stats/multimodal?days=30&source=VIDEO_CALL`（管理员） |
 
 ### AI 实验室接口（独立命名空间，返回自有 JSON 结构，不走统一信封）
 
@@ -245,7 +309,11 @@ backend/
 | `record_start_ts` / `record_end_ts` | 录音起止毫秒时间戳 |
 
 响应包含 `status`（ok/partial_success/failed）、`transcription`、`text_emotion`、
-`voice_emotion`、`facial_emotion`、`fusion`、`errors`、`timing`、`server_info.models_loaded`。
+`voice_emotion`、`facial_emotion`、`fusion`、`risk`（风险等级与判定依据）、
+`errors`、`timing`、`server_info.models_loaded`。
+
+每次调用都会写入 `multimodal_analysis_records` 留痕表（见"多模态分析留痕"），
+命中 MEDIUM/HIGH 时自动建立危机工单。
 
 #### `GET /api/analyze_audio/config_check`
 
@@ -314,7 +382,116 @@ AI 心理教练对话。请求：
 | `vc_llm_token` / `vc_llm_done` | 后端 → 前端 | LLM 流式 token / 完成 |
 | `vc_tts_start` / `vc_tts_chunk` / `vc_tts_done` | 后端 → 前端 | TTS 语音分句合成进度 |
 | `vc_vlm_result` | 后端 → 前端 | 视觉理解结果 |
+| `vc_session_started` / `vc_conversation_ready` | 后端 → 前端 | 会话已入库（`sessionId` / `conversationId`，用于通话结束后生成日记） |
+| `vc_crisis_alert` | 后端 → 前端 | 风险提示（`{ level, levelLabel, riskScore, reasons, hotline }`） |
 | `vc_interrupted` / `vc_error` | 后端 → 前端 | 打断确认 / 错误 |
+
+## 危机风险分级与响应
+
+判定规则集中在 `app/services/crisis_rules.py`（纯逻辑、无 I/O），
+建档与通知集中在 `app/services/crisis_service.py`。四个等级与响应动作：
+
+| 等级 | 触发条件（摘要） | 系统响应 |
+| --- | --- | --- |
+| `HIGH` | 明确的自伤/自杀表达，或"指向本人的强负性表达 + 计划/时点线索" | 建档 + 通知值班人员 + 向用户下发紧急求助提示 |
+| `MEDIUM` | 指向本人的强负性表达（无望、自我否定、撑不住） | 建档 + 通知值班人员 + 向用户下发关怀提示 |
+| `LOW` | 出现风险语汇但被否定、假设、转述、口语夸张或缓解语境削弱 | 不建档、不打扰用户，仅留痕与统计 |
+| `NONE` | 未命中任何规则 | — |
+
+关键设计（详见模块 docstring）：
+
+- 同一用户同一来源 10 分钟内去重，等级升高时升级工单并留痕；
+- 否定/转述/夸张/缓解语境降级，控制误报；中文省略主语的表达（如"不想再撑了"）按指向本人处理；
+- 多模态一致负性信号（语音 + 面部同时为负性）最多把等级提升到 `LOW`，
+  永远不能单独触发工单——视觉信号只用于留痕与对话策略，不用于对用户下结论；
+- 接入点：文字沟通教练、情绪日记、社群发帖、AI 心理教练（`/api/ai_coach/chat`）、
+  实时视频通话管线（`vc_*`）、音频分析接口（`/api/analyze_audio`）；
+- `CRISIS_KEYWORDS` 环境变量保留，用于在规则表之外追加高危关键词。
+
+## 多模态分析留痕
+
+表 `multimodal_analysis_records` 记录每次分析的输入、三模态输出、融合权重、
+置信度校准参数、线索冲突度量、风险等级、五阶段判定与各段耗时，用于形成可统计、
+可复核的评测数据（此前这些结果只写日志）。通过 `conversation_id` 与 `ai_conversations` 关联。
+
+- 写入由 `app/services/analysis_record_service.py` 负责，采用"尽力而为"策略：
+  留痕失败只记日志，不影响用户对话；
+- 实时管线使用 `asyncio.create_task` 异步写入，不阻塞 TTS 与 LLM 生成；
+- 应用迁移：`alembic upgrade head`（迁移 `d7e8f9a0b1c2` 建立留痕表与授权存证表，
+  并补齐会话/消息的阶段、风险与耗时字段）；
+- 统计出口：`GET /api/v1/admin/stats/multimodal`，结果中的 `sampled` 说明
+  分位数基于多少条明细样本（总量用 SQL 精确统计）。
+
+### 实时管线写入的耗时字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `asr_seconds` | 语音转写（SenseVoice） |
+| `multimodal_seconds` | 语调 + 文本 + 面部融合 |
+| `llm_first_token_seconds` | 首个 token 等待（含 Dify 往返） |
+| `llm_total_seconds` | LLM 全文生成 |
+| `tts_first_audio_seconds` | 首句 TTS 合成 |
+| `e2e_seconds` | 从收到音频到回复完成的端到端 |
+
+### Dify 工作流需要配套的改动
+
+平台把阶段判定结果作为入参回传，Dify 侧需做三处调整（详见 `docs/dify-工作流改动说明.md`）：
+
+1. start 节点新增 `current_stage` / `goal_clear` / `action_ready` /
+   `should_summarize_hint` / `platform_risk_level` 五个变量；
+2. `条件分支 2` 改为优先读取 `should_summarize_hint`；
+3. `知识检索` 节点接到 `普通心理教练` 之前，并把结果作为该 LLM 的 `context`
+   （现版本它是断头节点，检索结果不参与生成）。
+
+### LLM 供应商选择与回退
+
+视频通话的回复由「Dify 智能体优先，DeepSeek 兜底」生成，规则分两层，不要混为一谈：
+
+**1）选择规则**
+
+- 配了 `DIFY_API_KEY` → 每轮**先试 Dify**，同一轮内失败则**当场**改用 DeepSeek；
+- 没配 `DIFY_API_KEY` → 只用 DeepSeek（也可以在 `.env` 里注释掉 Key 来强制走 DeepSeek）。
+
+**2）单轮回退（用户不会没回复）**
+
+本轮 Dify 出现下列任一情况，都算「本轮无产出」，立刻在同一轮内用 DeepSeek 重试：
+
+- 请求异常（连接失败 / 超时，`LLM_RETRIES` 次重试后仍失败）；
+- HTTP 状态非 200；
+- 流正常结束但整轮没产出任何内容（例如工作流结构化输出解析失败）。
+
+注意：用户主动打断（`vc_interrupt`）导致的空回复**不算**失败，不会触发回退。
+
+**3）熔断（连续失败才"直接走 DeepSeek"）**
+
+- **连续失败 3 轮**（`DIFY_CIRCUIT_THRESHOLD`）→ 打开熔断；
+- 熔断期间 **120 秒**（`DIFY_CIRCUIT_COOLDOWN`）**完全跳过 Dify**，每轮直接走 DeepSeek，
+  不再白等一次 Dify 往返；
+- 冷却结束自动放行重试；任意一次成功立刻把计数与熔断复位。
+
+所以"Dify 挂了"的表现是：**前 3 轮**每轮多等一次 Dify 往返（日志会记 `Dify 错误:`），
+**之后 2 分钟**直接走 DeepSeek，**2 分钟后再试一次** Dify。
+
+**4）怎么确认当前状态**
+
+看后端日志即可：
+
+- `Dify HTTP 响应: status=...` / `首 token 到达（距离 HTTP 响应 X.Xs）` → 正常；
+- `Dify 错误: LLM API 返回 401`（HTTP 非 200）或 `本轮未产出内容，降级到下一个供应商重试`
+  （流正常但没内容）→ 触发了单轮回退，紧接着能看到 `DeepSeek HTTP 响应: status=200`；
+- `Dify 连续失败 N 次，熔断 Xs（期间自动走备用供应商）` → 刚打开熔断；
+- `Dify 熔断中（连续失败…），本轮跳过` → 正处于熔断冷却期，直接走 DeepSeek。
+
+### 前端接入契约
+
+前端已接入会话留痕与总结承接，改动最小、契约如下：
+
+1. `vc_start` 时携带授权范围 `{ consent: { mic, camera, multimodal, basis } }`，
+   后端写入 `consent_records`；未携带时按"旧客户端全模态缺省"处理并在存证中标注来源；
+2. 监听 `vc_conversation_ready`（`conversationId`）与 `vc_session_started`（`sessionId`）；
+3. 通话结束后 `POST /ai-conversations/{id}/summary` 取草稿，用户确认后
+   `POST /ai-conversations/{id}/summary/confirm` 保存（或沿用现有的
+   `POST /emotion-journals` + `sourceConversationId`），成功即生成关联的情绪日记。
 
 ## 数据库与迁移
 
@@ -327,9 +504,35 @@ AI 心理教练对话。请求：
 
 ```bash
 cd backend
-pytest tests -q                    # 全量 80 项
+pytest tests -q                    # 全量 180 项（其中约 100 项需要可连接的 MySQL）
 pytest tests/test_auth.py -q       # 单模块
 ```
+
+### 评测（多模态融合与危机分级）
+
+```bash
+cd backend
+python experiments/run_fusion_ablation.py   # 单模态/固定权重/动态权重消融
+python experiments/run_crisis_eval.py       # 危机分级准确率、漏报率、误报率
+python experiments/run_calibration.py       # 置信度校准（温度缩放），产出 FUSION_TEMPERATURE
+python experiments/run_stage_agreement.py   # 五阶段判定与人工标签的一致性（kappa / 混淆矩阵）
+python experiments/run_weight_tuning.py     # 权重网格搜索 + 交叉验证，对照线上规则
+python experiments/run_coach_ab.py --provider dry-run   # A/B 盲评（普通臂 vs 阶段臂）
+python experiments/run_runtime_stats.py     # 真实运行数据（成功率/降级率/P50/P95）
+```
+
+所有脚本都调用线上同一份实现（`fusion_service`、`crisis_rules`、`calibration`、
+`coach_stage_service`），结果打印为 Markdown 表格并写入 `experiments/results/`。
+其中 `run_runtime_stats.py` 与后台统计接口共用同一个聚合函数，保证报告数字与系统显示一致；
+样本格式与数据说明见 `experiments/README.md`。
+
+### 测试环境说明
+
+应用运行时使用长期存活的事件循环，连接池可正常复用；而 `TestClient` 会为每个测试
+模块创建并销毁独立事件循环，全局连接池中的连接可能"在旧循环建立、在新循环回收"，
+触发 asyncmy 的 `Event loop is closed`（Windows + Python 3.13 下尤为明显）。
+因此 `tests/conftest.py` 为测试进程单独构建了 `NullPool` 引擎：连接随用随开、
+在当前循环内释放，不影响应用运行时的池化配置。
 
 - 测试直连开发库，使用唯一手机号并在 teardown 清理；跑完建议清一下 `email_verification_codes` 等临时表避免冷却误伤：
   ```sql
@@ -373,7 +576,10 @@ pytest tests/test_auth.py -q       # 单模块
 
 - AI 教练不诊断、不治疗、不贴标签；系统提示词内置危机信号转介（心理援助热线 12356）；
 - `DEEPSEEK_API_KEY` 只从 `.env` 读取，`.env` 已 gitignore，禁止提交；
-- AI 实验室接口当前不要求登录（本地实验功能），若上线公网建议加鉴权与频控。
+- AI 实验室接口需要登录（`Authorization: Bearer <accessToken>`），SocketIO 连接复用同一套
+  JWT 校验，未登录连接直接拒绝；AI 相关端点另有限流（见 `app/core/rate_limit.py`）；
+- 语音与图像只用于当轮情绪上下文：授权范围写入 `consent_records`，未授权摄像头则丢弃画面帧，
+  未授权多模态则语调与面部不参与融合（`vc_start` 的 `consent` 参数）。
 
 ## 部署
 
@@ -405,7 +611,16 @@ uvicorn app.main:socket_app --host 0.0.0.0 --port 8000 --workers 1
 - **语音转文字失败**：先看 `/api/analyze_audio/config_check` 中 `sensevoice.loaded`；
   未加载则内存不足或首次下载未完成，释放内存后调 `/api/analyze_audio/warmup`。
 - **AI 教练返回 503**：`.env` 未配置 `DEEPSEEK_API_KEY`，或 Key 失效（查看响应 detail）。
+- **时区**：应用按 UTC 存储（`utcnow_naive`），但 `created_at` 一类字段由 MySQL
+  `CURRENT_TIMESTAMP` 写入（服务器本地时间）。做时间窗口比较时与数据库时钟对齐
+  （维护任务即用 `SELECT NOW()` 作为基准），不要混用两者。
 - **AI 回复报 `[llm] Insufficient Balance`**：DeepSeek 账号余额不足，充值或更换 Key 即可，非程序问题。
+- **回复里没有书籍内容 / 知识库 0 命中**：先看启动日志有没有「知识库索引已加载」；
+  没有就跑 `python scripts/build_kb_index.py`。Docker 部署还要确认 `data/` 进了镜像或挂了卷
+  （见「知识库上传与部署指南」第六节）。单测检索用 `build_kb_index.py --query "..."`。
+- **重建索引后结果没变**：索引在进程内有缓存，**重启后端**才会重新加载。
+- **知识库要不要传到 GitHub**：不要。语料是第三方版权出版物，索引里含原文片段，
+  两者都不入库；仓库只上传构建脚本与检索实现。
 - **服务进程被系统杀掉**：多为内存耗尽（模型 + 系统占用超限），关闭大内存程序或增加内存后再启动。
 - **测试退出时 torch 日志报错**：已通过懒加载修复；确认 `app.main` 导入时不应加载 torch/tensorflow。
 - **时区**：应用按 UTC 存储（`utcnow_naive`），数据库服务器时间可能为本地时间；涉及跨时区比较的新逻辑请统一使用 `utcnow_naive`。

@@ -1,0 +1,23 @@
+# 仅用于工具配置（本项目不是可安装包，运行方式见 README）
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+# 上游 vendored 代码（FunASR 的 SenseVoice 实现）不参与风格检查
+extend-exclude = ["app/services/ai_lab/sensevoice"]
+
+[tool.ruff.lint]
+# 选型原则：只保留"会真出问题"的规则，避免中文全角标点 / 长行噪声淹没信号。
+#   E9  语法级错误        F  未定义名 / 未使用导入变量
+#   B   flake8-bugbear    RUF006  asyncio 任务未持引用（会被 GC 丢任务）
+#   ASYNC 异步函数里的阻塞调用
+select = ["E9", "F", "B", "RUF006", "ASYNC"]
+ignore = [
+    "B008",     # FastAPI 依赖注入必须写成 Depends(...) 作默认值
+    "ASYNC230", # 本地小文件的 open 是快系统调用，不值得额外切线程
+    "ASYNC240", # 同上：os.path.isfile / getsize
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试大量使用"注册用户 → 断言"的直白写法，允许签名里的未用参数
+"tests/*" = ["ARG001", "ARG002"]

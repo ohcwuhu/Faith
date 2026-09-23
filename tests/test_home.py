@@ -1,4 +1,3 @@
-from sqlalchemy import select
 
 from app.db.session import SessionLocal
 from app.models.content import Banner

@@ -5,7 +5,6 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
 
 from app.core.exceptions import AppError
 from app.core.security import decode_access_token
@@ -44,16 +43,16 @@ async def get_current_user(
     try:
         payload = decode_access_token(credentials.credentials)
     except jwt.ExpiredSignatureError:
-        raise AppError(401, "TOKEN_EXPIRED", "登录已过期，请刷新")
+        raise AppError(401, "TOKEN_EXPIRED", "登录已过期，请刷新") from None
     except jwt.InvalidTokenError:
-        raise AppError(401, "UNAUTHORIZED", "登录凭证无效")
+        raise AppError(401, "UNAUTHORIZED", "登录凭证无效") from None
     if is_blacklisted(payload.get("jti", "")):
         raise AppError(401, "TOKEN_EXPIRED", "登录已失效，请重新登录")
 
     try:
         user_id = int(payload["sub"])
     except (KeyError, TypeError, ValueError):
-        raise AppError(401, "UNAUTHORIZED", "登录凭证无效")
+        raise AppError(401, "UNAUTHORIZED", "登录凭证无效") from None
     user = await db.get(User, user_id)
     if user is None or user.deleted_at is not None:
         raise AppError(401, "UNAUTHORIZED", "账号不存在")

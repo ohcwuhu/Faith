@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +35,13 @@ MAX_HISTORY_TURNS = 12
 
 # 最新视频帧缓存（per-session）
 MAX_FRAME_AGE_SECONDS = 10  # 超过10秒的帧视为过期
+
+# 长时间"没有任何语音活动"后的兜底收尾（秒）。
+# 前端在 75s 无语音时会自己结束通话；这里是服务端兜底，
+# 覆盖"标签页被挂起，前端定时器被浏览器节流"这类前端管不到的情况。
+# 只统计语音相关活动（收到音频分片 / 用户说完一轮 / 打断 / 改授权），
+# 摄像头帧不算——一直开着摄像头但始终不说话，同样应该收尾。
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("VC_IDLE_TIMEOUT_SECONDS", "300"))
 
 
 @dataclass
@@ -63,6 +72,21 @@ class VideoCallSession:
     # Dify 会话 ID（多轮上下文由 Dify 维护）
     dify_conversation_id: str = ""
 
+    # 数据库中的会话 ID（ai_conversations.id，留痕失败时为 None）
+    conversation_id: int | None = None
+
+    # 用户授权的模态范围（vc_start 带入；缺省为全开，兼容旧客户端）
+    #   camera=False    → 不使用摄像头画面（前端不上传帧）
+    #   multimodal=False → 语音语调与面部不参与情绪融合，只按谈话内容判断
+    consent_camera: bool = True
+    consent_multimodal: bool = True
+
+    # 已完成的对话轮次（用于阶段判定与留痕序号）
+    turn_index: int = 0
+
+    # 最近一轮的阶段判定结果（供 Dify 入参与留痕使用）
+    stage_context: dict[str, Any] = field(default_factory=dict)
+
     # 中断标志
     interrupted: bool = False
 
@@ -71,6 +95,16 @@ class VideoCallSession:
 
     # 情绪上下文（从面部识别结果更新）
     emotion_context: dict[str, Any] = field(default_factory=dict)
+
+    # 最近一次"语音活动"的时间戳（进入通话、收到音频、说完一轮、打断、改授权）
+    last_activity_at: float = field(default_factory=time.time)
+    # 空闲超时是否已经通知过前端（避免重复 emit / 重复归档）
+    idle_timeout_notified: bool = False
+
+    def touch(self) -> None:
+        """标记一次语音活动：重置空闲计时，允许下一次超时再次触发。"""
+        self.last_activity_at = time.time()
+        self.idle_timeout_notified = False
 
     def add_audio_chunk(self, chunk_b64: str) -> None:
         """添加音频分片到缓冲（保持前端发送的先后顺序）。"""
@@ -135,6 +169,9 @@ class VideoCallSession:
         self.latest_frame = ""
         self.last_visual_description = ""
         self.dify_conversation_id = ""
+        self.conversation_id = None
+        self.turn_index = 0
+        self.stage_context.clear()
         self.emotion_context.clear()
         self.state = STATE_IDLE
         self.interrupted = False
@@ -155,12 +192,82 @@ def get_session(sid: str) -> VideoCallSession:
 
 
 def remove_session(sid: str) -> None:
-    """移除会话。"""
-    if sid in _sessions:
-        _sessions[sid].clear()
-        del _sessions[sid]
+    """从会话表移除该 sid（不就地清空对象）。
+
+    这里刻意不调用 ``clear()``：实时管线在 ``_run_video_call_pipeline_from_file``
+    里持有同一个对象引用，一旦断线（或用户点结束通话）时把它清空，本轮还没落库的
+    ``conversation_id`` / ``turn_index`` / 对话历史就被抹掉，表现为
+    "断线后这一轮的助手回复没入库、留痕丢失会话关联"（日志里 ``conversation=None``）。
+
+    只摘掉字典引用即可：管线跑完后对象自然被回收，下一通电话会拿到新对象。
+    """
+    _sessions.pop(sid, None)
 
 
 def has_session(sid: str) -> bool:
     """检查会话是否存在。"""
     return sid in _sessions
+
+
+# ============================================================
+#  空闲看门狗：长时间无语音 → 结束通话
+# ============================================================
+# 真正的收尾动作（emit 事件、归档会话）要碰 socketio，所以在 socket_events
+# 注册回调，避免本模块反向依赖 app.main（会形成循环导入）。
+_idle_timeout_handler: Callable[[str, int], Awaitable[None]] | None = None
+
+
+def set_idle_timeout_handler(handler: Callable[[str, int], Awaitable[None]] | None) -> None:
+    """注册空闲超时的收尾回调（sid, 空闲秒数）。"""
+    global _idle_timeout_handler
+    _idle_timeout_handler = handler
+
+
+def idle_calls(
+    *,
+    max_idle_seconds: int = IDLE_TIMEOUT_SECONDS,
+    now: float | None = None,
+) -> list[tuple[str, int]]:
+    """列出空闲超时且仍在通话中的会话，返回 ``[(sid, 空闲秒数), ...]``。
+
+    纯查询，不改状态——便于单测；实际收尾走 :func:`sweep_idle_calls`。
+    """
+    current = time.time() if now is None else now
+    result: list[tuple[str, int]] = []
+    for sid, session in _sessions.items():
+        if session.state == STATE_IDLE or session.idle_timeout_notified:
+            continue
+        idle_seconds = int(current - session.last_activity_at)
+        if idle_seconds >= max_idle_seconds:
+            result.append((sid, idle_seconds))
+    return result
+
+
+async def sweep_idle_calls(
+    *,
+    max_idle_seconds: int = IDLE_TIMEOUT_SECONDS,
+) -> list[str]:
+    """结束长时间没有语音活动的会话，返回被收尾的 sid 列表。
+
+    由定时任务调用（见 app/core/scheduler.py）。任何单个会话出错都不影响其他会话。
+    """
+    handler = _idle_timeout_handler
+    expired = idle_calls(max_idle_seconds=max_idle_seconds)
+    if not expired or handler is None:
+        if expired:
+            _log.warning("[Session] 有 %d 个空闲会话，但未注册收尾回调，跳过", len(expired))
+        return []
+
+    ended: list[str] = []
+    for sid, idle_seconds in expired:
+        session = _sessions.get(sid)
+        if session is None:
+            continue
+        # 先打标记再执行收尾：即便收尾过程抛异常，也不会每次扫描重复触发
+        session.idle_timeout_notified = True
+        try:
+            await handler(sid, idle_seconds)
+            ended.append(sid)
+        except Exception as exc:  # noqa: BLE001 - 单个会话失败不影响其他会话
+            _log.warning("[Session] 空闲收尾失败 sid=%s: %s", sid, exc)
+    return ended

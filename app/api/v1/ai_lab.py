@@ -28,12 +28,16 @@ from typing import Any
 _log = logging.getLogger("ai-lab")
 
 import anyio
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.api.deps import get_current_user, require_role
+from app.core.exceptions import AppError
+from app.core.rate_limit import rate_limit
 from app.models.user import User
 from app.services.ai_lab import config
+from app.services.analysis_record_service import AnalysisSnapshot, save_snapshot
+from app.services import crisis_service
 
 # ============================================================
 #  导入常驻服务
@@ -137,6 +141,7 @@ async def analyze_audio(
     sid: str = Form(""),
     record_start_ts: float = Form(0.0),   # 前端 Date.now() 毫秒级
     record_end_ts: float = Form(0.0),     # 前端 Date.now() 毫秒级
+    _limiter: None = Depends(rate_limit("analyze_audio", 60, 60)),
 ) -> JSONResponse:
     """
     多模态音频分析接口（融合版）。
@@ -175,9 +180,10 @@ async def analyze_audio(
                 tf.write(chunk)
                 total_size += len(chunk)
                 if total_size > 50 * 1024 * 1024:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="音频文件过大（> 50MB），请分段后重试或缩短录音时长。",
+                    raise AppError(
+                        413,
+                        "FILE_TOO_LARGE",
+                        "音频文件过大（> 50MB），请分段后重试或缩短录音时长。",
                     )
         finally:
             tf.close()
@@ -254,6 +260,12 @@ async def analyze_audio(
         total_elapsed = round(time.time() - total_start, 3)
 
         # ---------- 6) 构造响应 ----------
+        # 内部字段只用于服务端决策，不对外暴露（先取值，再清理）
+        voice_fallback_used = bool(voice_result.get("_fallback_used")) if voice_result else False
+        if voice_result:
+            voice_result.pop("_fallback_used", None)
+            voice_result.pop("_fallback_error", None)
+
         # 判断整体状态
         success_count = int(asr_result is not None) + int(voice_result is not None) + int(text_result is not None and text_error is None)
         if success_count == 3:
@@ -304,14 +316,34 @@ async def analyze_audio(
                     "text_emotion": _TE.get_status().get("loaded"),
                     "opensmile": _OS.get_status().get("loaded"),
                 },
-                "voice_fallback_used": voice_result.get("_fallback_used", False) if voice_result else False,
+                "voice_fallback_used": voice_fallback_used,
             },
         }
 
-        # 清除内部字段（不对外暴露）
-        if voice_result:
-            voice_result.pop("_fallback_used", None)
-            voice_result.pop("_fallback_error", None)
+        # ---------- 7) 风险分级 + 分析留痕 ----------
+        transcription_text = response_body["transcription"]["text"]
+        risk = crisis_service.assess(
+            transcription_text,
+            signals={
+                "voice_emotion": voice_result.get("emotion") if voice_result else None,
+                "voice_confidence": voice_result.get("confidence") if voice_result else 0.0,
+                "facial_emotion": fusion_result["facial_emotion"].get("dominant_emotion"),
+                "facial_confidence": fusion_result["facial_emotion"].get("confidence"),
+                "facial_frames": fusion_result["facial_emotion"].get("frame_count"),
+            },
+        )
+        response_body["risk"] = risk.to_dict()
+
+        await save_snapshot(
+            AnalysisSnapshot.from_http_response(response_body, user_id=user.id)
+        )
+        if risk.flagged:
+            await crisis_service.flag_crisis_safely(
+                user.id,
+                crisis_service.SOURCE_AI_LAB,
+                transcription_text,
+                assessment=risk,
+            )
 
         return JSONResponse(content=response_body)
 
@@ -373,16 +405,22 @@ async def warmup(
 #  视频通话音频上传（给 socket 管线使用，避免大 base64 传输乱序）
 # ================================================================
 import uuid
-import shutil
 
 _VC_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "vc_uploads")
 os.makedirs(_VC_UPLOAD_DIR, exist_ok=True)
+
+#: 单段录音上限：实时通话一轮最长 60s，webm/opus 下 20MB 已相当宽裕
+_VC_AUDIO_MAX_BYTES = 20 * 1024 * 1024
+#: 允许的音频后缀白名单（不在其中统一按 .webm 处理）
+_VC_AUDIO_SUFFIXES = (".webm", ".webma", ".ogg", ".mp3", ".wav", ".opus")
+
 
 @router.post("/vc_audio_upload")
 async def vc_audio_upload(
     user: User = Depends(get_current_user),
     file: UploadFile = File(...),
     sid: str = Form(""),
+    _limiter: None = Depends(rate_limit("vc_audio_upload", 60, 60)),
 ) -> JSONResponse:
     """
     视频通话音频上传接口。
@@ -396,23 +434,39 @@ async def vc_audio_upload(
 
         file_id = uuid.uuid4().hex
         suffix = os.path.splitext(file.filename)[1] or ".webm"
-        if suffix not in (".webm", ".webma", ".ogg", ".mp3", ".wav", ".opus"):
+        if suffix not in _VC_AUDIO_SUFFIXES:
             suffix = ".webm"
         dest_path = os.path.join(_VC_UPLOAD_DIR, f"{file_id}{suffix}")
 
+        # 分块读 + 体积上限：避免单次请求把临时目录写满（写盘放线程池，不卡事件循环）
+        written = 0
         with open(dest_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > _VC_AUDIO_MAX_BYTES:
+                    f.close()
+                    os.unlink(dest_path)
+                    _log.warning("[VC Upload] sid=%s 音频超过上限 %dB，已拒绝",
+                                 sid, _VC_AUDIO_MAX_BYTES)
+                    return JSONResponse(
+                        content={"error": f"音频文件过大（>{_VC_AUDIO_MAX_BYTES // 1024 // 1024}MB），请缩短录音时长"},
+                        status_code=413,
+                    )
+                await anyio.to_thread.run_sync(f.write, chunk)
 
         file_size = os.path.getsize(dest_path)
         _log.info("[VC Upload] sid=%s, file_id=%s, size=%dB, path=%s",
                   sid, file_id, file_size, dest_path)
 
+        # 只回传 file_id：服务器绝对路径属于内部信息，前端拿到 file_id 即可
         return JSONResponse(content={
             "ok": True,
             "file_id": file_id,
-            "file_path": dest_path,
             "file_size": file_size,
         })
     except Exception as e:
         _log.error("[VC Upload] 上传失败: %s", e, exc_info=True)
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": "音频上传失败，请重试"}, status_code=500)

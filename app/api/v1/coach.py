@@ -35,8 +35,6 @@ from app.services.coach_service import (
     create_profile,
     create_phrase,
     delete_phrase,
-    get_own_service_or_404,
-    get_own_phrase_or_404,
     get_profile_or_404,
     list_clients,
     list_coach_slots,
@@ -56,7 +54,6 @@ from app.utils.format import mask_phone
 from app.utils.time import to_iso
 from app.services.appointment_service import (
     cancel_coach_appointment,
-    coach_appointment_to_out,
     coach_appointments_to_out,
     complete_appointment,
     confirm_appointment,
@@ -493,7 +490,7 @@ async def coach_cases_export(
         try:
             parsed_ids = [int(part) for part in parts]
         except ValueError:
-            raise AppError(400, "VALIDATION_ERROR", "个案编号格式错误")
+            raise AppError(400, "VALIDATION_ERROR", "个案编号格式错误") from None
     records = await list_all_cases(db, coach.id, ids=parsed_ids)
     if parsed_ids is not None and len(records) != len(set(parsed_ids)):
         raise AppError(400, "VALIDATION_ERROR", "包含不存在的个案编号")

@@ -130,7 +130,7 @@ def analyze(text: str) -> dict[str, Any]:
 
     # 映射到统一 7 类标签
     probs = {label: 0.0 for label in UNIFIED_LABELS}
-    for label, score in zip(result["labels"], result["scores"]):
+    for label, score in zip(result["labels"], result["scores"], strict=False):
         unified = LABEL_MAP.get(label, "neutral")
         probs[unified] = float(score)
 

@@ -30,7 +30,7 @@ def test_admin_users_manage(client, admin_headers):
     assert resp.status_code == 201
     user_id = resp.json()["data"]["user"]["id"]
     token = resp.json()["data"]["accessToken"]
-    user_headers = {"Authorization": f"Bearer {token}"}
+    assert token, "注册未返回 accessToken"
     try:
         resp = client.get("/api/v1/admin/users?keyword=待管理&page=1&pageSize=10", headers=admin_headers)
         assert resp.status_code == 200

@@ -1,4 +1,4 @@
-"""生产调度器：订单超时释放 / 导出过期清理 / 孤儿文件扫描（APScheduler）。"""
+"""生产调度器：订单超时释放 / 导出过期清理 / 孤儿文件扫描 / 异常会话收尾（APScheduler）。"""
 
 import os
 
@@ -28,14 +28,33 @@ async def _run_cleanup() -> None:
     try:
         async with AsyncSessionLocal() as db:
             from app.services.data_export_service import cleanup_expired_exports
-            from app.services.maintenance_service import sweep_orphan_uploads
+            from app.services.maintenance_service import (
+                sweep_orphan_uploads,
+                sweep_stale_coaching_sessions,
+            )
 
             expired = await cleanup_expired_exports(db)
             orphans = await sweep_orphan_uploads(db)
-            if expired or orphans:
-                logger.info("[SCHEDULER] 清理导出 %s 个、孤儿文件 %s 个", expired, orphans)
+            stale = await sweep_stale_coaching_sessions(db)
+            if expired or orphans or stale:
+                logger.info(
+                    "[SCHEDULER] 清理导出 %s 个、孤儿文件 %s 个、异常中断会话 %s 个",
+                    expired, orphans, stale,
+                )
     except Exception:  # noqa: BLE001
         logger.exception("[SCHEDULER] 清理任务异常")
+
+
+async def _run_sweep_idle_calls() -> None:
+    """结束长时间没有语音活动的通话（前端挂起时的服务端兜底）。"""
+    try:
+        from app.services.ai_lab import realtime_session
+
+        ended = await realtime_session.sweep_idle_calls()
+        if ended:
+            logger.info("[SCHEDULER] 无语音超时自动结束通话 %s 个", len(ended))
+    except Exception:  # noqa: BLE001
+        logger.exception("[SCHEDULER] 空闲通话清理异常")
 
 
 def start_scheduler() -> None:
@@ -61,8 +80,16 @@ def start_scheduler() -> None:
         coalesce=True,
         replace_existing=True,
     )
+    scheduler.add_job(
+        _run_sweep_idle_calls,
+        IntervalTrigger(seconds=60),
+        id="sweep_idle_calls",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("[SCHEDULER] 定时任务已启动（订单超时 1min / 清理 1h）")
+    logger.info("[SCHEDULER] 定时任务已启动（订单超时 1min / 清理 1h / 空闲通话 1min）")
 
 
 def shutdown_scheduler() -> None:

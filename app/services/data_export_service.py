@@ -13,7 +13,6 @@ from app.models.chat import ChatConversation, ChatMessage
 from app.models.compliance import DataExport
 from app.models.content import Article, ArticleFavorite
 from app.models.growth import CheckIn, EmotionJournal, SelfCoachingRecord, UserBadge
-from app.models.notification import Notification
 from app.models.user import User
 from app.models.v1_1 import Order, Review, Wallet, WalletTransaction
 from app.services.appointment_service import list_my_appointments, my_appointments_to_out

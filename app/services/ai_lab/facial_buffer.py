@@ -16,7 +16,6 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from typing import Any
 
 # ============================================================
 #  全局缓冲（per-sid）

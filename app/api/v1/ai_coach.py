@@ -11,16 +11,22 @@ AI 心理教练（DeepSeek Chat API）
 """
 from __future__ import annotations
 
-import os
+import logging
 from typing import Any
 
+import anyio
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_current_user
+from app.core.exceptions import AppError
+from app.core.rate_limit import rate_limit
 from app.models.user import User
+from app.services import crisis_service
 from app.services.ai_lab import config
+
+log = logging.getLogger("ai-coach")
 
 router = APIRouter(prefix="/api/ai_coach", tags=["ai-coach"])
 
@@ -47,6 +53,14 @@ SYSTEM_PROMPT = """你是一位专业、温暖、克制的「AI 心理教练」�
 - 始终用中文回复。
 - 一次只问一个问题，避免连珠炮式提问。
 - 不要输出大段理论或说教。"""
+
+#: 风险判定达到 MEDIUM/HIGH 时追加的处置指令（优先级高于风格要求）
+CRISIS_DIRECTIVE = """【本轮安全处置要求（优先级高于其他风格要求）】
+系统检测到用户本次表达可能存在自伤/自杀风险信号。请按以下顺序回应：
+1. 先表达关心与接纳，不评判、不追问方式细节，不渲染悲剧感；
+2. 明确建议用户拨打全国心理援助热线 12356（24 小时），或前往就近医院急诊，
+   并鼓励其联系信任的人陪伴；
+3. 不进行任何心理/精神疾病诊断，不提供医疗建议，不讨论自伤方式。"""
 
 
 class ChatMessage(BaseModel):
@@ -99,14 +113,77 @@ def _build_context_message(ctx: CoachContext) -> str | None:
     )
 
 
+def _latest_user_text(req: ChatRequest) -> str:
+    """取最近一条用户消息；没有则回退到识别上下文中的转写文本。"""
+    for message in reversed(req.messages):
+        if message.role == "user" and message.content.strip():
+            return message.content.strip()
+    if req.context and req.context.transcription:
+        return req.context.transcription.strip()
+    return ""
+
+
+def _risk_signals(ctx: CoachContext | None) -> dict[str, Any]:
+    """把识别上下文转换为风险分级所需的模态信号。"""
+    if ctx is None:
+        return {}
+    return {
+        "voice_emotion": ctx.voice_emotion,
+        "voice_confidence": ctx.voice_emotion_confidence or 0.0,
+        "facial_emotion": ctx.facial_emotion,
+        "facial_confidence": 0.0,
+        "facial_frames": 0,
+    }
+
+
+def _request_completion(api_key: str, history: list[dict[str, str]]) -> requests.Response:
+    """同步调用上游模型（由线程池执行，避免阻塞事件循环）。"""
+    return requests.post(
+        f"{config.DEEPSEEK_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": config.DEEPSEEK_MODEL,
+            "messages": history,
+            "temperature": 0.7,
+            "max_tokens": 600,
+            "stream": False,
+        },
+        timeout=config.DEEPSEEK_TIMEOUT,
+    )
+
+
 @router.post("/chat")
-def chat(req: ChatRequest, user: User = Depends(get_current_user)) -> dict[str, Any]:
-    """与 AI 心理教练对话（携带可选识别上下文）。"""
+async def chat(
+    req: ChatRequest,
+    user: User = Depends(get_current_user),
+    _limiter: None = Depends(rate_limit("ai_coach_chat", 30, 60)),
+) -> dict[str, Any]:
+    """与 AI 心理教练对话（携带可选识别上下文）。
+
+    每次请求都会先做一次风险分级：命中 MEDIUM/HIGH 时建立危机工单、
+    向模型注入安全处置指令，并在响应中返回 ``risk`` 字段供前端展示。
+    """
     api_key = config.DEEPSEEK_API_KEY
     if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="AI 教练服务未配置 DEEPSEEK_API_KEY，请在 backend/.env 中设置后重启后端。",
+        # 走统一业务异常：前端只认 {code, message, data} 包络，HTTPException
+        # 会产生 {"detail": ...}，前端只能退化成"请求失败"
+        raise AppError(
+            503,
+            "AI_NOT_CONFIGURED",
+            "AI 教练服务未配置，请在后台设置 DEEPSEEK_API_KEY 后重启服务。",
+        )
+
+    user_text = _latest_user_text(req)
+    risk = crisis_service.assess(user_text, _risk_signals(req.context))
+    if risk.flagged:
+        await crisis_service.flag_crisis_safely(
+            user.id,
+            crisis_service.SOURCE_AI_COACH,
+            user_text,
+            assessment=risk,
         )
 
     history: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -114,6 +191,9 @@ def chat(req: ChatRequest, user: User = Depends(get_current_user)) -> dict[str, 
     ctx_msg = _build_context_message(req.context) if req.context else None
     if ctx_msg:
         history.append({"role": "system", "content": ctx_msg})
+
+    if risk.flagged:
+        history.append({"role": "system", "content": CRISIS_DIRECTIVE})
 
     # 只保留最近 12 条对话，控制 token 消耗
     history.extend(
@@ -123,42 +203,34 @@ def chat(req: ChatRequest, user: User = Depends(get_current_user)) -> dict[str, 
     )
 
     try:
-        resp = requests.post(
-            f"{config.DEEPSEEK_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": config.DEEPSEEK_MODEL,
-                "messages": history,
-                "temperature": 0.7,
-                "max_tokens": 600,
-                "stream": False,
-            },
-            timeout=config.DEEPSEEK_TIMEOUT,
-        )
+        resp = await anyio.to_thread.run_sync(_request_completion, api_key, history)
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"AI 服务请求失败：{e}") from e
+        # 上游异常细节只进日志，不回传给客户端（避免泄露内部信息）
+        log.warning("AI 教练上游请求失败: %s", e)
+        raise AppError(502, "AI_UPSTREAM_ERROR", "AI 服务暂时不可用，请稍后再试。") from e
 
     if resp.status_code != 200:
-        detail = "AI 服务暂时不可用，请稍后再试。"
         try:
             err_body = resp.json()
-            detail = err_body.get("error", {}).get("message") or detail
+            upstream_detail = err_body.get("error", {}).get("message")
         except Exception:
-            pass
+            upstream_detail = None
+        log.warning("AI 教练上游返回 %s: %s", resp.status_code, upstream_detail or resp.text[:200])
         status = 429 if resp.status_code == 429 else 502
-        raise HTTPException(status_code=status, detail=f"AI 服务返回错误：{detail}")
+        code = "AI_RATE_LIMITED" if status == 429 else "AI_UPSTREAM_ERROR"
+        message = "AI 服务繁忙，请稍后再试。" if status == 429 else "AI 服务暂时不可用，请稍后再试。"
+        raise AppError(status, code, message)
 
     data = resp.json()
     try:
         reply = data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError) as e:
-        raise HTTPException(status_code=502, detail="AI 服务响应格式异常") from e
+        log.warning("AI 教练响应格式异常: %s", data)
+        raise AppError(502, "AI_BAD_RESPONSE", "AI 服务响应异常，请稍后再试。") from e
 
     return {
         "reply": reply,
         "model": data.get("model", config.DEEPSEEK_MODEL),
         "usage": data.get("usage", {}),
+        "risk": risk.to_dict(),
     }

@@ -25,6 +25,7 @@ from app.services.emotion_journal_service import (
     pick_feedback,
 )
 from app.services.crisis_service import maybe_flag_crisis
+from app.utils.time import utcnow_naive
 
 router = APIRouter(prefix="/emotion-journals", tags=["emotion-journals"])
 
@@ -65,6 +66,9 @@ async def create_journal(
         conv = await db.get(AiConversation, source_conversation_id)
         if conv is not None:
             conv.journal_id = journal.id
+            # 记录"总结已确认"：对话详情据此展示总结与确认时间
+            conv.summary = journal.content
+            conv.summary_confirmed_at = utcnow_naive()
     await maybe_flag_crisis(db, user.id, "EMOTION_JOURNAL", body.content)
     await db.commit()
     await db.refresh(journal)

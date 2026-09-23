@@ -18,7 +18,6 @@ from app.schemas.checkin import (
 from app.services.checkin_service import (
     check_in,
     leaderboard,
-    my_badges,
     my_checkins,
     my_stats,
 )

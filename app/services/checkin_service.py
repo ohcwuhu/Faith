@@ -75,7 +75,7 @@ async def my_checkins(db: AsyncSession, user_id: int, month: str) -> list[CheckI
         start = date(year, mon, 1)
         end = (start + timedelta(days=32)).replace(day=1)
     except ValueError:
-        raise AppError(400, "VALIDATION_ERROR", "月份格式应为 YYYY-MM")
+        raise AppError(400, "VALIDATION_ERROR", "月份格式应为 YYYY-MM") from None
     return list(
         await db.scalars(
             select(CheckIn)

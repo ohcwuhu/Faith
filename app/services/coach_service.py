@@ -17,7 +17,7 @@ from app.models.user import AdminActionLog, User
 from app.models.v1_1 import ClientRelation
 from app.services.notification_service import notify
 from app.schemas.coach import CoachProfileIn, CoachProfilePatchIn, ServiceIn
-from app.schemas.coach import ServicePatchIn, SlotBatchIn, SlotIn
+from app.schemas.coach import ServicePatchIn, SlotBatchIn
 from app.utils.time import to_iso, utcnow_naive
 from datetime import date as date_type
 from datetime import datetime, timedelta
@@ -135,7 +135,7 @@ async def list_coach_slots(db: AsyncSession, coach_profile_id: int, start_date: 
         start = date_type.fromisoformat(start_date)
         end = date_type.fromisoformat(end_date)
     except ValueError:
-        raise AppError(400, "VALIDATION_ERROR", "日期格式应为 YYYY-MM-DD")
+        raise AppError(400, "VALIDATION_ERROR", "日期格式应为 YYYY-MM-DD") from None
     if end < start:
         raise AppError(400, "VALIDATION_ERROR", "结束日期不能早于开始日期")
     from app.models.coach import CoachSlot

@@ -1,6 +1,5 @@
 import time
 
-import pytest
 from sqlalchemy import select
 
 from app.db.session import SessionLocal

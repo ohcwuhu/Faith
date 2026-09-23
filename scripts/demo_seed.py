@@ -146,8 +146,9 @@ def main() -> None:
             (5, "没有说教，一直在引导我自己找到答案，收获很大。"),
             (4, "氛围很放松，建议也很落地，期待下一次。"),
         ]
-        latest = None
-        for i, (slot, (rating, content)) in enumerate(zip(slots_for_booking[:3], review_data)):
+        for i, (slot, (rating, content)) in enumerate(
+            zip(slots_for_booking[:3], review_data, strict=False)
+        ):
             slot.status = "BOOKED"
             appointment = Appointment(
                 appointment_no=f"APDEMO000{i + 1}",
@@ -168,7 +169,6 @@ def main() -> None:
                 rating=rating,
                 content=content,
             ))
-            latest = appointment
         # 一条已完成但未评价的预约，方便体验评价流程
         pending_review_slot = slots_for_booking[3]
         pending_review_slot.status = "BOOKED"

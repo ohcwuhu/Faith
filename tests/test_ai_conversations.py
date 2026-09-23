@@ -72,7 +72,7 @@ def test_ai_conversation_persistence(client, monkeypatch):
         db = SessionLocal()
         try:
             user_id = db.scalar(select(User.id).where(User.phone == acc["phone"]))
-            other_id = db.scalar(select(User.id).where(User.phone == other["phone"]))
+            assert db.scalar(select(User.id).where(User.phone == other["phone"])) is not None
         finally:
             db.close()
 

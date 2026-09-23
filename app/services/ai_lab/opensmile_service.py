@@ -20,15 +20,12 @@ import io
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 import wave
-from collections import OrderedDict
 from typing import Any
 
-from app.services.ai_lab import config
 import numpy as np
 import pandas as pd
 
@@ -111,15 +108,12 @@ class EmotionAnalyzer:
         pitch_mean = self._safe_get(row, "F0semitoneFrom27.5Hz_sma3nz_amean", 0.0)
         pitch_std = self._safe_get(row, "F0semitoneFrom27.5Hz_sma3nz_stddevNorm", 0.0)
         pitch_range = self._safe_get(row, "F0semitoneFrom27.5Hz_sma3nz_pctlrange0-2", 0.0)
-        pitch_rise = self._safe_get(row, "F0semitoneFrom27.5Hz_sma3nz_meanRisingSlope", 0.0)
         pitch_fall = self._safe_get(row, "F0semitoneFrom27.5Hz_sma3nz_meanFallingSlope", 0.0)
 
         loudness_mean = self._safe_get(row, "loudness_sma3_amean", 0.0)
         loudness_std = self._safe_get(row, "loudness_sma3_stddevNorm", 0.0)
-        loudness_pct80 = self._safe_get(row, "loudness_sma3_percentile80.0", 0.0)
 
         speech_rate = self._safe_get(row, "VoicedSegmentsPerSec", 0.0)
-        voiced_ratio = self._safe_get(row, "MeanVoicedSegmentLengthSec", 0.0)
         unvoiced_len = self._safe_get(row, "MeanUnvoicedSegmentLength", 0.0)
 
         jitter = self._safe_get(row, "jitterLocal_sma3nz_amean", 0.0)
@@ -129,7 +123,6 @@ class EmotionAnalyzer:
         alpha_ratio = self._safe_get(row, "alphaRatioV_sma3nz_amean", 0.0)
         hammarberg = self._safe_get(row, "hammarbergIndexV_sma3nz_amean", 0.0)
         spectral_flux = self._safe_get(row, "spectralFlux_sma3_amean", 0.0)
-        mfcc1 = self._safe_get(row, "mfcc1_sma3_amean", 0.0)
 
         # =================================================================
         #  中文语音适配权重（与英文差异核心修正）

@@ -13,7 +13,6 @@ from app.services.article_service import (
     get_public_articles,
     increment_view_count,
     list_categories,
-    list_my_favorites,
     toggle_favorite,
 )
 

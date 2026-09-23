@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import AppError
 from app.models.coach import Appointment, AppointmentEvent, CoachProfile, CoachSlot, Service
 from app.models.user import User
-from app.models.v1_1 import ClientRelation, Order, Payment, Refund, Review
+from app.models.v1_1 import ClientRelation, Order, Review
 from app.services.notification_service import notify
 from app.utils.format import mask_phone
 from app.schemas.appointment import AppointmentCreateIn
@@ -203,7 +203,7 @@ async def create_appointment(
             )
             if existing is not None:
                 return existing, False
-        raise AppError(409, "SLOT_UNAVAILABLE", "所选时段已被预约")
+        raise AppError(409, "SLOT_UNAVAILABLE", "所选时段已被预约") from None
     await db.refresh(appointment)
     await unlock_conversation(db, user.id, coach.id)
     return appointment, True
@@ -448,7 +448,7 @@ async def list_coach_appointments(
         try:
             parsed = date_type.fromisoformat(slot_date)
         except ValueError:
-            raise AppError(400, "VALIDATION_ERROR", "日期格式应为 YYYY-MM-DD")
+            raise AppError(400, "VALIDATION_ERROR", "日期格式应为 YYYY-MM-DD") from None
         stmt = (
             stmt.join(CoachSlot, CoachSlot.id == Appointment.slot_id)
             .where(CoachSlot.date == parsed)

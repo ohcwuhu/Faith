@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppError
 from app.models.coach import CoachProfile, CoachTag
-from app.models.content import Article, ArticleCategory, ArticleFavorite, Banner
+from app.models.content import Article, ArticleCategory, Banner
 from app.models.growth import EmotionFeedbackLib
 from app.models.user import AdminActionLog, User
 from app.schemas.admin import (

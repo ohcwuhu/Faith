@@ -17,7 +17,6 @@ TTS 语音合成服务（edge-tts）
 from __future__ import annotations
 
 import logging
-import asyncio
 from typing import AsyncGenerator
 
 _log = logging.getLogger("tts-service")

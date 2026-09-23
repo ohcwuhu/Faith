@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from app.api.v1 import (
     admin,
+    admin_ai,
     admin_audit,
     admin_crisis,
     admin_orders,
@@ -241,6 +242,7 @@ app.include_router(admin_orders.router, prefix="/api/v1")
 app.include_router(admin_orders.wallet_router, prefix="/api/v1")
 app.include_router(admin_audit.router, prefix="/api/v1")
 app.include_router(admin_crisis.router, prefix="/api/v1")
+app.include_router(admin_ai.router, prefix="/api/v1")
 app.include_router(ai_conversations.router, prefix="/api/v1")
 
 # ─── AI 实验室：多模态音频分析 + AI 心理教练 ──────────────────────────
@@ -252,7 +254,9 @@ logger.info("[INIT] AI 实验室路由已挂载（/api/analyze_audio, /api/ai_co
 # ─── AI 实验室：SocketIO 实时情绪识别 ────────────────────────────────
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins="*",
+    # 与 HTTP 侧共用同一份来源白名单：Socket.IO 也做登录校验（见 socket_events
+    # 的 connect 处理器），这里再收一层，避免"任意站点可发起连接"的默认值
+    cors_allowed_origins=cors_origin_list(),
     logger=False,
     engineio_logger=False,
 )

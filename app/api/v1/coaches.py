@@ -14,7 +14,6 @@ from app.models.coach import CoachProfile, CoachSlot, CoachTag, Service, Tag
 from app.models.user import User
 from app.schemas.review import ReviewOut
 from app.services.review_service import coach_reviews, review_to_out
-from app.utils.time import to_iso
 
 router = APIRouter(prefix="/coaches", tags=["coaches"])
 

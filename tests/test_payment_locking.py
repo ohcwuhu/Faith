@@ -1,13 +1,13 @@
 """支付锁定阶段一：余额 / 模拟支付 / 退款 / 超时释放。"""
 
 import time as time_mod
-from datetime import date, datetime, time, timedelta
+from datetime import date, time, timedelta
 
 import pytest
 from sqlalchemy import select, update
 
 from app.db.session import SessionLocal
-from app.models.coach import Appointment, CoachProfile, CoachSlot
+from app.models.coach import Appointment, CoachSlot
 from app.models.user import User
 from app.models.v1_1 import Order, Payment, Refund
 from app.utils.time import utcnow_naive

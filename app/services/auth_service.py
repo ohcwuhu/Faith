@@ -1,6 +1,6 @@
 """认证业务逻辑：用户校验、令牌签发与刷新。"""
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession

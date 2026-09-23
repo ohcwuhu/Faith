@@ -175,7 +175,7 @@ def analyze(audio_path: str) -> dict[str, Any]:
 
         # 映射到统一 7 类（other/unknown 合并到 neutral）
         probs = {label: 0.0 for label in UNIFIED_LABELS}
-        for label, score in zip(labels, scores):
+        for label, score in zip(labels, scores, strict=False):
             lab_str = str(label).split("/")[-1]
             if lab_str == "<unk>":
                 lab_str = "unknown"

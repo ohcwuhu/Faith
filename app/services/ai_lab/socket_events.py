@@ -21,16 +21,19 @@ Socket 事件定义
   - 人脸置信度过滤阈值 0.60 一致
 """
 import os
+import re
 import time
 import base64
+import asyncio
 from datetime import datetime
-
-from app.db.session import AsyncSessionLocal
 
 # cv2 / numpy / DeepFace 在函数内懒加载，避免应用启动即加载 TensorFlow/torch
 
 # ─── 面部时序缓冲（供 HTTP 层 /api/analyze_audio 融合时查询）─────────
 from app.services.ai_lab import facial_buffer
+
+# ─── 后台任务登记（保持强引用，避免留痕任务被 GC 回收）───────────────
+from app.core.tasks import spawn_task
 
 # ─── 情绪分数映射（与 Flask 版本完全一致）─────────────────────────────
 EMOTION_SCORE = {
@@ -65,6 +68,11 @@ THROTTLE_INTERVAL = 0.4
 # 人脸置信度过滤阈值（低于此值的人脸不计入统计）
 FACE_CONFIDENCE_THRESHOLD = 0.60
 
+# ─── 上传音频文件 ID 的格式约束 ───────────────────────────────────────
+# 与 /api/vc_audio_upload 生成的 uuid4().hex 一致；严格校验是为了杜绝
+# 客户端用 "../" 之类的 file_id 越出上传目录（拼路径前先挡掉）。
+UPLOAD_FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
 # ─── 视频通话模式：LLM 系统提示词 ──────────────────────────────
 _VC_SYSTEM_PROMPT = """你是一位专业、温暖的「AI 心理教练」，正在与用户进行实时视频通话。
 
@@ -83,6 +91,16 @@ _VC_SYSTEM_PROMPT = """你是一位专业、温暖的「AI 心理教练」，正
 - 避免使用 markdown 格式、列表、代码块等（因为是语音输出）。
 - 句子简短，便于 TTS 分句合成。"""
 
+# ─── 危机场景：追加给 LLM 的处置指令 ────────────────────────────────
+# 仅在规则引擎判定 MEDIUM/HIGH 时注入，避免普通对话被安全话术占据
+_CRISIS_SYSTEM_DIRECTIVE = """【本轮安全处置要求（优先级高于其他风格要求）】
+系统检测到用户本轮表达可能存在自伤/自杀风险信号。请按以下顺序回应：
+1. 先表达关心与接纳，不评判、不追问方式细节，不渲染悲剧感；
+2. 明确建议用户拨打全国心理援助热线 12356（24 小时），或前往就近医院急诊，
+   并鼓励其联系信任的人陪伴；
+3. 不进行任何心理/精神疾病诊断，不提供医疗建议，不讨论自伤方式；
+4. 回复保持简短、口语化，适合语音播放。"""
+
 # ─── 客户端独立状态管理 ──────────────────────────────────────────────
 # 每个 sid 维护独立状态；disconnect 时主动清理，杜绝内存泄漏。
 # 后续若需扩展（如 per-client 计时器、音频缓冲队列），在此结构追加字段。
@@ -97,6 +115,60 @@ def score_to_level(score: int) -> str:
         return "NEUTRAL"
     else:
         return "BORING"
+
+
+# ─── Dify 自判风险等级：字段名兼容多种工作流写法 ──────────────────────
+_DIFY_RISK_KEYS = ("risk_level", "riskLevel", "dify_risk_level", "risk")
+
+
+def _extract_dify_risk(payload: object) -> str | None:
+    """从一路 Dify SSE 事件里取出工作流自判的风险等级（取不到返回 ``None``）。
+
+    不同工作流的暴露方式不同，按命中概率依次尝试：
+
+    1. ``workflow_finished`` 的 ``data.outputs``（结束节点输出变量）；
+    2. ``message_end`` 的 ``metadata``；
+    3. 事件顶层 / ``data`` 里的同名字段。
+
+    只接受字符串或数字，避免把结构化对象当成等级写进留痕。
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    sources: list[dict] = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        sources.append(data)
+        outputs = data.get("outputs")
+        if isinstance(outputs, dict):
+            sources.append(outputs)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+
+    for source in sources:
+        for key in _DIFY_RISK_KEYS:
+            value = source.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return str(value).strip()
+    return None
+
+
+async def _backfill_dify_risk(snapshot_task, session_id: str, level: str) -> None:
+    """等本轮留痕落库后，把 Dify 自判风险等级补写到该行。
+
+    顺序敏感：留痕是后台任务写的，必须等它提交完成再 UPDATE，
+    否则会补写到上一轮的行上（同一会话同一时刻只跑一轮管线）。
+    """
+
+    from app.services.analysis_record_service import update_dify_risk_level
+
+    if snapshot_task is not None:
+        try:
+            await asyncio.shield(snapshot_task)
+        except Exception:  # noqa: BLE001 - 留痕失败不影响主流程
+            return
+    await update_dify_risk_level(session_id, level)
 
 
 def decode_base64_frame(img_base64: str):
@@ -118,7 +190,7 @@ def decode_base64_frame(img_base64: str):
         frame = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
         return frame
     except Exception as e:
-        raise ValueError(f"Failed to decode base64 frame: {e}")
+        raise ValueError(f"Failed to decode base64 frame: {e}") from e
 
 
 def analyze_emotion(frame):
@@ -193,6 +265,201 @@ def analyze_emotion(frame):
     }
 
 
+# ============================================================
+#  SSE 流消费：Token 实时推流 + 按句联动 TTS
+#  提到模块级是为了可测：此前它藏在 register_socket_events 闭包里，
+#  闭包里的 _cfg / _b64 缺 import 也没人能测出来（分句 TTS 一直被跳过）。
+# ============================================================
+
+def _split_sentences(text: str) -> list[str]:
+    """将文本按句号/问号/感叹号/换行切分为句子。"""
+    import re
+    parts = re.split(r'([。！？!?\n])', text)
+    sentences: list[str] = []
+    for i in range(0, len(parts) - 1, 2):
+        s = (parts[i] + parts[i + 1]).strip()
+        if s:
+            sentences.append(s)
+    # 处理末尾没有标点的部分
+    if len(parts) % 2 == 1 and parts[-1].strip():
+        sentences.append(parts[-1].strip())
+    return sentences
+
+# 强制分句最大长度 —— 超过此长度就算没标点也切（避免回复很慢）
+_MAX_SENTENCE_LEN = 160
+
+async def _consume_llm_stream(sio, log, resp, *, is_dify: bool, sid: str, session) -> dict:
+    """解析一路 LLM 的 SSE 响应：Token 实时推前端、按句联动 TTS。
+
+    返回 ``{full_response, sentence_buffer, token_count, first_token_t,
+    first_tts_t, resp_t0, error}``。``full_response`` 为空或 ``error`` 非空，
+    都表示这一路没跑出可用内容，调用方据此决定是否降级到下一个供应商。
+    """
+    import json as _json
+    import base64 as _b64
+    import time as _jtime
+
+    from app.services.ai_lab import config as _cfg
+    from app.services.ai_lab import tts_service as _tts
+
+    full_response = ""
+    sentence_buffer = ""
+    token_count = 0
+    first_token_t: float | None = None
+    first_tts_t: float | None = None
+    error: str | None = None
+    dify_risk_level: str | None = None
+    dify_saw_message_end = False
+    dify_post_end_events = 0
+    line_count = 0
+    resp_t0 = _jtime.time()
+
+    for line in resp.iter_lines(decode_unicode=True):
+        line_count += 1
+        # 【关键修正】SSE 流处理中即使收到打断，也继续解析（full_response 要完整）
+        #   只在需要触发 TTS 合成时，才根据 llm_cancelled 跳过语音
+        if not line:
+            continue
+        if not line.startswith("data: "):
+            # SSE 中非 data 行（如空行/注释），忽略
+            continue
+        data_str = line[6:]
+        if data_str.strip() == "[DONE]":
+            log.info("[VC] %s | SSE 收到 [DONE], 共 %d 行, %d tokens",
+                     sid, line_count, token_count)
+            break
+        try:
+            chunk_data = _json.loads(data_str)
+            if is_dify:
+                # 工作流自判风险等级（可能出现在 workflow_finished 的 outputs
+                # 或 message_end 的 metadata 里），取到即留痕，供两侧一致性统计
+                _found_risk = _extract_dify_risk(chunk_data)
+                if _found_risk:
+                    dify_risk_level = _found_risk
+                event = chunk_data.get("event", "")
+                if event == "message_end":
+                    _cid = chunk_data.get("conversation_id")
+                    if _cid:
+                        session.dify_conversation_id = _cid
+                    log.info("[VC] %s | Dify message_end | conversation_id=%s",
+                             sid, session.dify_conversation_id)
+                    # message_end 之后通常还有 workflow_finished（携带结束节点
+                    # 输出变量，例如工作流自判的 risk_level），继续读到流结束，
+                    # 否则拿不到工作流的输出，两侧一致性永远为空。
+                    # 最多再等 20 个事件，避免异常服务端不回结束事件时卡住。
+                    dify_saw_message_end = True
+                    continue
+                if dify_saw_message_end:
+                    dify_post_end_events += 1
+                    if dify_post_end_events > 20:
+                        log.warning(
+                            "[VC] %s | message_end 后仍未收到 workflow_finished，提前结束解析", sid,
+                        )
+                        break
+                if event == "workflow_finished":
+                    log.info("[VC] %s | Dify workflow_finished | risk=%s",
+                             sid, dify_risk_level or "(未暴露)")
+                    break
+                if event == "error":
+                    error = chunk_data.get("message") or "Dify 智能体错误"
+                    log.error("[VC] %s | Dify 错误事件: %s", sid, error)
+                    break
+                if event not in ("message", "agent_message"):
+                    continue
+                token = chunk_data.get("answer") or ""
+                if not token:
+                    continue
+            else:
+                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                token = delta.get("content", "")
+                if not token:
+                    continue
+            token_count += 1
+            full_response += token
+            sentence_buffer += token
+
+            # 推送 token 到前端
+            await sio.emit("vc_llm_token", {"token": token}, room=sid)
+
+            # 记录首 token 时间（量化延迟用）
+            if first_token_t is None:
+                first_token_t = _jtime.time()
+                log.info("[VC] %s | [4/5] 首 token 到达（距离 HTTP 响应 %.1fs）",
+                         sid, first_token_t - resp_t0)
+
+            # 检查句子边界 → 触发 TTS
+            sentences = _split_sentences(sentence_buffer)
+            force_tts = False
+            force_text = ""
+            if len(sentences) > 1:
+                # 前面的完整句子送 TTS
+                force_tts = True
+                force_text = sentences[0]
+                sentence_buffer = "".join(sentences[1:])
+            elif len(sentence_buffer) >= _MAX_SENTENCE_LEN:
+                # 强制分句：没标点但超过 160 字也切
+                force_tts = True
+                force_text = sentence_buffer[:_MAX_SENTENCE_LEN]
+                sentence_buffer = sentence_buffer[_MAX_SENTENCE_LEN:]
+
+            if force_tts and force_text.strip() and not session.llm_cancelled:
+                if first_tts_t is None:
+                    first_tts_t = _jtime.time()
+                    log.info("[VC] %s | [4/5] 首次触发 TTS（首 token → 首个声音输出 %.1fs）",
+                             sid, first_tts_t - first_token_t)
+                log.info("[VC] %s | [4/5] %s分句 TTS: %s",
+                         sid, "强制" if len(sentences) <= 1 else "标点", force_text[:40])
+
+                await sio.emit("vc_tts_start", {"text": force_text}, room=sid)
+                try:
+                    tts_chunk_idx = 0
+                    tts_was_cancelled_during = False
+                    async for audio_chunk in _tts.synthesize(
+                        force_text, voice=_cfg.TTS_VOICE, rate=_cfg.TTS_RATE
+                    ):
+                        # 关键修改：TTS 合成过程中即使被打断，也继续把当前句的音频发完
+                        # 这样用户能完整听到这一句话，而不是只播放一半
+                        if session.llm_cancelled:
+                            tts_was_cancelled_during = True
+                        tts_chunk_idx += 1
+                        audio_b64 = _b64.b64encode(audio_chunk).decode("ascii")
+                        await sio.emit("vc_tts_chunk", {
+                            "data": audio_b64,
+                            "format": "mp3",
+                        }, room=sid)
+                    if tts_was_cancelled_during:
+                        log.info("[VC] %s | [4/5] TTS 句完成（期间被打断，已完整合成 %d 个分片，后续只收文字不再TTS）", sid, tts_chunk_idx)
+                    else:
+                        log.info("[VC] %s | [4/5] TTS 句完成: %d 个分片", sid, tts_chunk_idx)
+                    await sio.emit("vc_tts_done", {"text": force_text}, room=sid)
+                    # 【关键修正】即使被打断也不退出 SSE 循环！
+                    #   vc_interrupt 的唯一语义 = 停止后续 TTS 语音播放
+                    #   LLM 文字生成必须完整解析到底，保证用户能看到完整文字回复
+                    #   后续句子会因为 session.llm_cancelled=True 而自动跳过 TTS
+                    #   绝不能 break，否则 full_response 就残缺了！
+                except Exception as e:
+                    log.warning("[VC] %s | TTS 分句失败: %s", sid, e, exc_info=True)
+                    await sio.emit("vc_error", {
+                        "stage": "tts", "message": str(e)
+                    }, room=sid)
+
+        except _json.JSONDecodeError:
+            continue
+
+    log.info("[VC] %s | [4/5] SSE 解析完成, full_response 长度=%d, token_count=%d",
+             sid, len(full_response), token_count)
+    return {
+        "full_response": full_response,
+        "sentence_buffer": sentence_buffer,
+        "token_count": token_count,
+        "first_token_t": first_token_t,
+        "first_tts_t": first_tts_t,
+        "resp_t0": resp_t0,
+        "error": error,
+        "dify_risk_level": dify_risk_level,
+    }
+
+
 def register_socket_events(sio, log):
     """
     注册所有 SocketIO 事件处理器到主实例。
@@ -200,6 +467,40 @@ def register_socket_events(sio, log):
     """
     import os as _os
     import tempfile as _tmp
+
+    from app.services.ai_lab import realtime_session as _rt
+
+    # ─── 空闲看门狗收尾：长时间无语音时由定时任务触发（见 realtime_session）───
+    async def _handle_idle_timeout(sid: str, idle_seconds: int) -> None:
+        """把长时间无语音的通话收尾：通知前端、置空闲、归档会话。
+
+        前端自己也会在无语音到点后结束通话；这里是服务端兜底，
+        覆盖"标签页被挂起 / 前端定时器被浏览器节流"的情况。
+        """
+        from app.services import ai_conversation_service as _conv
+
+        log.info("[VC] %s | 无语音 %ds，服务端自动结束通话", sid, idle_seconds)
+        session = _rt.get_session(sid) if _rt.has_session(sid) else None
+        conv_id = session.conversation_id if session else None
+
+        if session is not None:
+            session.state = _rt.STATE_IDLE
+            session.llm_cancelled = True
+            session.audio_chunks.clear()
+            session.conversation_id = None
+        clients.get(sid, {}).pop("ai_conv_id", None)
+
+        await sio.emit("vc_idle_timeout", {
+            "reason": "no_speech",
+            "idleSeconds": idle_seconds,
+            "message": "长时间没有听到你的声音，通话已自动结束",
+        }, room=sid)
+        await sio.emit("vc_state_change", {"state": "idle"}, room=sid)
+
+        if conv_id:
+            await _conv.end_session_safely(conv_id, status="ABANDONED")
+
+    _rt.set_idle_timeout_handler(_handle_idle_timeout)
 
     # ─── 连接事件：初始化客户端独立状态 ────────────────────────────
     @sio.on("connect")
@@ -225,15 +526,21 @@ def register_socket_events(sio, log):
     #       推理队列等异步任务，需在此处一并 cancel/close，杜绝内存泄漏。
     @sio.on("disconnect")
     async def handle_disconnect(sid):
-        _conv_id = clients.get(sid, {}).get("ai_conv_id") if sid in clients else None
+        # 断线时收尾 AI 对话会话：客户端异常断开时不会触发 vc_stop
+        from app.services.ai_conversation_service import end_session_safely
+
+        _session = None
+        try:
+            from app.services.ai_lab import realtime_session as _rt
+
+            if _rt.has_session(sid):
+                _session = _rt.get_session(sid)
+        except Exception:  # noqa: BLE001 - 断线清理不得因读取会话失败而中断
+            _session = None
+        _conv_id = getattr(_session, "conversation_id", None) if _session else None
         if _conv_id:
-            try:
-                from app.services.ai_conversation_service import end_ai_conversation
-                async with AsyncSessionLocal() as db:
-                    await end_ai_conversation(db, _conv_id)
-                log.info("[VC] %s | 断线，AI 会话 %s 已结束", sid, _conv_id)
-            except Exception as _e:
-                log.warning("[VC] %s | 断线结束 AI 会话失败: %s", sid, _e)
+            await end_session_safely(_conv_id, status="ABANDONED")
+            log.info("[VC] %s | 断线，AI 会话 %s 标记为异常中断", sid, _conv_id)
         if sid in clients:
             client = clients.pop(sid)
             duration = round(time.time() - client.get("connect_at", time.time()), 2)
@@ -265,6 +572,13 @@ def register_socket_events(sio, log):
 
         client_state = clients[sid]
         now = time.time()
+
+        # 1.5) 授权兜底：视频通话会话已撤回摄像头授权时，服务端拒绝处理画面帧
+        #      （前端不再上传是默认行为，这里是"撤回即刻生效"的服务端保证）
+        from app.services.ai_lab import realtime_session as _vc_sessions
+        if _vc_sessions.has_session(sid) and not _vc_sessions.get_session(sid).consent_camera:
+            log.debug("[SKIP] %s | 已撤回摄像头授权，丢弃画面帧", sid)
+            return
 
         # 2) 时间戳节流：丢弃过快帧（对齐 smartclass-ai 限流思路）
         #    不进入 DeepFace，直接 return，避免推理堆积。
@@ -310,8 +624,12 @@ def register_socket_events(sio, log):
             return
 
         # 5) DeepFace 情绪识别（参数与 Flask 版本完全一致）
+        #    推理是 CPU 密集的同步调用，必须丢到线程池：
+        #    直接在事件循环里跑会把同一进程的 HTTP 请求与其他 socket 连接一起卡住。
         try:
-            analysis = analyze_emotion(frame)
+            analysis = await asyncio.get_running_loop().run_in_executor(
+                None, analyze_emotion, frame
+            )
         except Exception as e:
             log.error(f"[ERROR] {sid} | DeepFace 推理异常: {e}", exc_info=True)
             await sio.emit("emotion_error", {
@@ -422,28 +740,11 @@ def register_socket_events(sio, log):
         """检测用户话语是否包含视觉查询意图。"""
         return any(kw in text for kw in _VISUAL_KEYWORDS)
 
-    def _split_sentences(text: str) -> list[str]:
-        """将文本按句号/问号/感叹号/换行切分为句子。"""
-        import re
-        parts = re.split(r'([。！？!?\n])', text)
-        sentences: list[str] = []
-        for i in range(0, len(parts) - 1, 2):
-            s = (parts[i] + parts[i + 1]).strip()
-            if s:
-                sentences.append(s)
-        # 处理末尾没有标点的部分
-        if len(parts) % 2 == 1 and parts[-1].strip():
-            sentences.append(parts[-1].strip())
-        return sentences
-
-    # 强制分句最大长度 —— 超过此长度就算没标点也切（避免回复很慢）
-    _MAX_SENTENCE_LEN = 160
 
     async def _run_video_call_pipeline_from_file(sid: str, audio_path: str):
         """视频通话核心管线（新入口：直接接收磁盘文件路径）。"""
-        import asyncio
         import base64 as _b64
-        import os as _os
+        import time as _time
 
         from app.services.ai_lab import realtime_session
         from app.services.ai_lab import sensevoice_service as _sv
@@ -454,11 +755,22 @@ def register_socket_events(sio, log):
         from app.services.ai_lab import text_emotion_service as _te
         from app.services.ai_lab import opensmile_service as _oss
         from app.services.ai_lab import fusion_service as _fs
-        from app.services.ai_lab import facial_buffer as _fb
+        from app.services import crisis_service as _crisis
+        from app.services.analysis_record_service import (
+            AnalysisSnapshot as _AnalysisSnapshot,
+            save_snapshot as _save_analysis_snapshot,
+        )
+        from app.services import ai_conversation_service as _conversation
+        from app.services.coach_stage_service import decide_stage as _decide_stage
+        from app.services.ai_lab import dify_service as _dify
+        from app.services.ai_lab import kb_service as _kb
 
         session = realtime_session.get_session(sid)
         session.state = realtime_session.STATE_THINKING
         await sio.emit("vc_state_change", {"state": "thinking"}, room=sid)
+
+        # 一轮对话的计时起点（端到端耗时以"收到音频"为基准）
+        _turn_t0 = _time.time()
 
         try:
             file_size = os.path.getsize(audio_path)
@@ -485,7 +797,9 @@ def register_socket_events(sio, log):
                 # ── 1) SenseVoice ASR ──────────────────────────────
                 log.info("[VC] %s | [1/5] 开始 ASR 识别...", sid)
                 loop = asyncio.get_event_loop()
+                _asr_t0 = _time.time()
                 asr_result = await loop.run_in_executor(None, _sv.transcribe, audio_path)
+                _asr_seconds = round(_time.time() - _asr_t0, 3)
                 asr_text = asr_result.get("text", "").strip()
                 emo = asr_result.get("emo", "neutral")
 
@@ -500,6 +814,13 @@ def register_socket_events(sio, log):
                     "text": asr_text,
                     "emo": emo,
                 }, room=sid)
+
+                # 知识检索与 1.5) 多模态分析并发跑：BM25 召回 + DeepSeek 重排约 2~4s，
+                # 放在这里和多模态分析重叠，不占用关键路径。
+                # （Dify 侧的向量/关键词检索在当前账号下不可用，见 kb_service 模块说明）
+                _kb_future = asyncio.ensure_future(
+                    loop.run_in_executor(None, _kb.context_block_smart, asr_text)
+                )
 
                 # 【关键修正】ASR 完成后绝不因为"打断"而丢弃
                 #   vc_interrupt 的唯一语义 = 停止后续 TTS 语音播放
@@ -519,7 +840,16 @@ def register_socket_events(sio, log):
                         result["_fallback_used"] = False
                         return result
                     except Exception as e1:
-                        log.warning("[VC] %s | emotion2vec 失败, 降级 opensmile: %s", sid, e1)
+                        # 偶发抖动（如 dtype/并发导致的单次失败）重试一次，
+                        # 避免直接掉到精度差得多的 opensmile 兜底
+                        log.warning("[VC] %s | emotion2vec 失败，重试一次: %s", sid, e1)
+                        try:
+                            result = _ev.analyze(audio_path)
+                            result["_fallback_used"] = False
+                            result["_retried"] = True
+                            return result
+                        except Exception as e1b:
+                            log.warning("[VC] %s | emotion2vec 重试仍失败, 降级 opensmile: %s", sid, e1b)
                         try:
                             result = _oss.analyze(audio_path)
                             # opensmile 是 8 类，转换为统一 7 类
@@ -553,11 +883,18 @@ def register_socket_events(sio, log):
                         log.warning("[VC] %s | text_emotion 失败: %s", sid, e)
                         return None
 
-                # 并发执行两个情感分析
-                voice_result, text_result = await asyncio.gather(
-                    loop.run_in_executor(None, _run_voice_emotion),
-                    loop.run_in_executor(None, _run_text_emotion),
-                )
+                if not session.consent_multimodal:
+                    # 用户未授权多模态分析：跳过语调分析，只保留文本情感。
+                    # 授权范围见 vc_start 写入的 consent 快照与 consent_records 表。
+                    log.info("[VC] %s | 用户未授权多模态分析，本轮跳过语调情感", sid)
+                    voice_result = None
+                    text_result = await loop.run_in_executor(None, _run_text_emotion)
+                else:
+                    # 并发执行两个情感分析
+                    voice_result, text_result = await asyncio.gather(
+                        loop.run_in_executor(None, _run_voice_emotion),
+                        loop.run_in_executor(None, _run_text_emotion),
+                    )
 
                 # SenseVoice emo 辅助信号
                 sv_emo_result = {"emotion": emo, "source": "SenseVoice emo"}
@@ -575,6 +912,7 @@ def register_socket_events(sio, log):
                         sid=sid,
                         record_start_ts=_record_start,
                         record_end_ts=_record_end,
+                        include_facial=session.consent_multimodal,
                     )
                 except Exception as e:
                     log.warning("[VC] %s | fusion_service 失败: %s", sid, e, exc_info=True)
@@ -585,20 +923,25 @@ def register_socket_events(sio, log):
                 if fusion_result and fusion_result.get("fusion"):
                     _f = fusion_result["fusion"]
                     _facial = fusion_result.get("facial_emotion", {})
+                    _conflict = _f.get("conflict") or {}
                     session.emotion_context.update({
                         "fusion_emotion": _f.get("final_emotion_cn", ""),
                         "fusion_emotion_en": _f.get("final_emotion", ""),
                         "fusion_confidence": _f.get("overall_confidence", 0),
                         "live_score": _facial.get("confidence", 0),
                         "live_level": _facial.get("dominant_emotion_cn", ""),
+                        "conflict_level": _conflict.get("level", ""),
+                        "needs_clarification": bool(_conflict.get("needs_clarification")),
+                        "conflict_reason": _conflict.get("reason", ""),
                     })
-                    log.info("[VC] %s | [1.5/5] 多模态融合完成 (%.1fs) | 融合情绪=%s(%.0f%%) | 面部=%s | 语调=%s | 文本=%s",
+                    log.info("[VC] %s | [1.5/5] 多模态融合完成 (%.1fs) | 融合情绪=%s(%.0f%%) | 面部=%s | 语调=%s | 文本=%s | 冲突=%s",
                              sid, _mm_elapsed,
                              _f.get("final_emotion_cn", "?"),
                              _f.get("overall_confidence", 0) * 100,
                              _facial.get("dominant_emotion_cn", "无数据"),
                              voice_result.get("emotion_cn", "无") if voice_result else "无",
-                             text_result.get("emotion_cn", "无") if text_result else "无")
+                             text_result.get("emotion_cn", "无") if text_result else "无",
+                             _conflict.get("level", "?"))
                 else:
                     # 融合失败时至少用 ASR emo 和单独分析结果
                     _voice_emo = voice_result.get("emotion_cn", "") if voice_result else ""
@@ -620,6 +963,119 @@ def register_socket_events(sio, log):
                     "asr_emo": emo,
                     "elapsed_seconds": round(_mm_elapsed, 2),
                 }, room=sid)
+
+                # ── 1.8) 危机风险分级（文本 + 多模态信号）────────────
+                _user_id = clients.get(sid, {}).get("user_id")
+                _facial_summary = (fusion_result or {}).get("facial_emotion") or {}
+                _risk_signals = {
+                    "voice_emotion": voice_result.get("emotion") if voice_result else None,
+                    "voice_confidence": voice_result.get("confidence", 0.0) if voice_result else 0.0,
+                    "facial_emotion": _facial_summary.get("dominant_emotion"),
+                    "facial_confidence": _facial_summary.get("confidence", 0.0),
+                    "facial_frames": _facial_summary.get("frame_count", 0),
+                }
+                _risk = _crisis.assess(asr_text, _risk_signals)
+                session.emotion_context["risk_level"] = _risk.level
+                session.emotion_context["risk_score"] = _risk.risk_score
+                log.info(
+                    "[VC] %s | [1.8/5] 风险分级: %s（评分 %s）| %s",
+                    sid, _risk.level, _risk.risk_score,
+                    "；".join(_risk.reasons[:2]) or "无命中",
+                )
+
+                if _risk.flagged:
+                    await sio.emit("vc_crisis_alert", {
+                        "level": _risk.level,
+                        "levelLabel": _risk.level_label_cn,
+                        "riskScore": _risk.risk_score,
+                        "reasons": list(_risk.reasons),
+                        "hotline": "12356",
+                    }, room=sid)
+                    if _user_id:
+                        # 建档写库不阻塞对话：失败只记日志
+                        spawn_task(
+                            _crisis.flag_crisis_safely(
+                                int(_user_id),
+                                _crisis.SOURCE_VIDEO_CALL,
+                                asr_text,
+                                assessment=_risk,
+                            ),
+                            name=f"crisis-flag:{sid}",
+                        )
+
+                # ── 1.9) 五阶段状态判定（平台侧确定性引擎）─────────────
+                #   结果落库并作为入参回传给 Dify，保证"阶段口径"只有一个来源。
+                _stage_decision = _decide_stage(
+                    session.get_chat_history(),
+                    asr_text,
+                    turn_index=session.turn_index + 1,
+                )
+                session.stage_context = _stage_decision.to_dict()
+                session.emotion_context["coach_stage"] = _stage_decision.stage
+                log.info(
+                    "[VC] %s | [1.9/5] 阶段判定: %s (goal=%s action=%s summarize=%s) | %s",
+                    sid, _stage_decision.stage_label_cn,
+                    _stage_decision.goal_clear, _stage_decision.action_ready,
+                    _stage_decision.should_summarize,
+                    "；".join(_stage_decision.evidence) or "无线索",
+                )
+
+                # 分析留痕：让识别结果成为可统计的数据资产（失败不影响对话）
+                # 保持任务引用：管线结束后要用它把 Dify 自判风险等级补写到本行
+                _snapshot_task = spawn_task(_save_analysis_snapshot(
+                    _AnalysisSnapshot.from_video_call(
+                        user_id=int(_user_id) if _user_id else None,
+                        session_id=sid,
+                        asr_text=asr_text,
+                        asr_emotion=emo,
+                        text_emotion=text_result,
+                        voice_emotion=voice_result,
+                        fusion=(fusion_result or {}).get("fusion"),
+                        facial_emotion=_facial_summary,
+                        risk=_risk.to_dict(),
+                        stage=_stage_decision.to_dict(),
+                        # 此处先留空：Dify 的自判等级要等 LLM 结束事件
+                        # （workflow_finished / message_end）才拿得到，
+                        # 由 _backfill_dify_risk 在本轮结束后补写该行。
+                        # 工作流确实没暴露时保持 NULL，一致性统计会跳过该行。
+                        dify_risk_level=None,
+                        conversation_id=session.conversation_id,
+                        timings={
+                            "asr_seconds": _asr_seconds,
+                            "multimodal_seconds": round(_mm_elapsed, 3),
+                        },
+                        status="ok" if fusion_result else "partial_success",
+                    )
+                ), name=f"analysis-snapshot:{sid}")
+
+                # ── 1.95) 用户表达落库（先落库再生成，被打断也不丢）──────
+                #   尽力而为：写库失败只记日志，不影响用户体验。
+                spawn_task(_conversation.record_message_safely(
+                    session.conversation_id,
+                    role="USER",
+                    content=asr_text,
+                    turn_index=session.turn_index + 1,
+                    emotion={
+                        "fusion_emotion_cn": session.emotion_context.get("fusion_emotion", ""),
+                        "fusion_emotion_en": session.emotion_context.get("fusion_emotion_en", ""),
+                        "fusion_confidence": session.emotion_context.get("fusion_confidence", 0),
+                        "live_level": session.emotion_context.get("live_level", ""),
+                        "risk_level": _risk.level,
+                    },
+                    snapshot=_conversation.TurnSnapshot(
+                        turn_index=session.turn_index + 1,
+                        user_text=asr_text,
+                        stage=_stage_decision.stage,
+                        goal_clear=_stage_decision.goal_clear,
+                        action_ready=_stage_decision.action_ready,
+                        should_summarize=_stage_decision.should_summarize,
+                        summary_reason=_stage_decision.summary_reason,
+                        risk_level=_risk.level,
+                        risk_score=_risk.risk_score,
+                        fusion_emotion=session.emotion_context.get("fusion_emotion_en"),
+                        fusion_confidence=session.emotion_context.get("fusion_confidence"),
+                    ),
+                ), name=f"record-user:{sid}")
 
                 # 【关键修正】情感分析完成后绝不因为"打断"而丢弃
                 #   打断仅影响 TTS 播放，不影响 LLM 文本生成推进
@@ -685,6 +1141,12 @@ def register_socket_events(sio, log):
                         "content": f"摄像头画面内容描述（VLM识别）：{visual_context}"
                     })
 
+                # 危机场景：注入安全处置指令（优先级高于风格要求）
+                if session.emotion_context.get("risk_level") in (
+                    _crisis.LEVEL_MEDIUM, _crisis.LEVEL_HIGH,
+                ):
+                    history.append({"role": "system", "content": _CRISIS_SYSTEM_DIRECTIVE})
+
                 # 对话历史
                 history.extend(session.get_chat_history()[-12:])
                 log.info("[VC] %s | [3/5] LLM 请求构造完成, history=%d 条", sid, len(history))
@@ -697,6 +1159,17 @@ def register_socket_events(sio, log):
                 _voice_conf = float(voice_result.get("confidence", 0) or 0) if voice_result else 0
                 _text_cn = text_result.get("emotion_cn", "") if text_result else ""
                 _text_conf = float(text_result.get("confidence", 0) or 0) if text_result else 0
+
+                # 取回上面并发执行的知识检索结果（失败不影响本轮通话）
+                try:
+                    knowledge_context = await _kb_future
+                except Exception as _e:
+                    log.warning("[VC] %s | 知识检索失败，本轮不带参考资料：%s", sid, _e)
+                    knowledge_context = ""
+                if knowledge_context:
+                    log.info("[VC] %s | [1/5] 知识检索命中 %d 字参考资料",
+                             sid, len(knowledge_context))
+
                 dify_inputs = {
                     "user_utterance": asr_text,
                     "fusion_emotion_cn": _emo_ctx.get("fusion_emotion", ""),
@@ -711,26 +1184,33 @@ def register_socket_events(sio, log):
                     "live_level": _facial_cn,
                     "asr_text": asr_text,
                     "visual_description": visual_context,
+                    # 平台侧阶段判定回传：工作流据此选择"继续教练 / 进入收束"，
+                    # 使阶段口径只有一个权威来源（见 coach_stage_service）。
+                    "current_stage": _stage_decision.stage,
+                    "goal_clear": _stage_decision.goal_clear,
+                    "action_ready": _stage_decision.action_ready,
+                    "should_summarize_hint": _stage_decision.should_summarize,
+                    "platform_risk_level": _risk.level,
+                    # 线索冲突信号：工作流可据此先澄清再回应
+                    # （模态互相矛盾时才为 true，见 fusion_service._compute_conflict）
+                    "modality_conflict": bool(_emo_ctx.get("needs_clarification")),
+                    "modality_conflict_reason": _emo_ctx.get("conflict_reason", ""),
+                    # 平台侧自建检索（jieba + BM25，DeepSeek 重排）的结果，
+                    # 需在 Dify 开始节点声明同名变量并在提示词里引用，见 docs/知识库检索方案.md
+                    "knowledge_context": knowledge_context,
                 }
-                log.info("[VC] %s | Dify inputs: %s", sid, {k: v for k, v in dify_inputs.items() if v})
+                log.info("[VC] %s | Dify inputs: %s", sid, {
+                    k: (v[:60] + "…" if isinstance(v, str) and len(v) > 60 else v)
+                    for k, v in dify_inputs.items() if v
+                })
 
-                # 持久化：用户消息（含情绪上下文快照）
-                _persist_uid = clients.get(sid, {}).get("user_id")
-                _persist_conv = clients.get(sid, {}).get("ai_conv_id")
-                if _persist_uid and _persist_conv:
-                    try:
-                        _emotion_snapshot = {
-                            "fusion_emotion_cn": _emo_ctx.get("fusion_emotion", ""),
-                            "fusion_confidence": _emo_ctx.get("fusion_confidence", 0),
-                            "voice_emotion_cn": _voice_cn,
-                            "text_emotion_cn": _text_cn,
-                            "live_level": _facial_cn,
-                        }
-                        from app.services.ai_conversation_service import append_ai_message
-                        async with AsyncSessionLocal() as db:
-                            await append_ai_message(db, _persist_conv, "USER", asr_text, emotion=_emotion_snapshot)
-                    except Exception as _e:
-                        log.warning("[VC] %s | 用户消息持久化失败: %s", sid, _e)
+                # 按工作流声明的类型转换入参：变量被声明成 text-input 时，
+                # JSON 布尔值会被 Dify 直接拒绝（"(type 'text-input') xxx must be a string"），
+                # 整个工作流一步都不跑。详见 app/services/ai_lab/dify_service.py。
+                # 只在真的要走 Dify 时查：DeepSeek 分支用不到 inputs，
+                # 每次都查一次 /parameters 会在 Dify 网络慢时白等最多 DIFY_TIMEOUT 秒。
+                if use_dify:
+                    dify_inputs = _dify.normalize_inputs(dify_inputs)
 
                 # ── 4) LLM 流式输出 + TTS 联动 ─────────────────────
                 session.state = realtime_session.STATE_SPEAKING
@@ -743,22 +1223,25 @@ def register_socket_events(sio, log):
                 token_count = 0
                 _first_token_t: float | None = None
                 _first_tts_t: float | None = None
+                _llm_resp_t0: float | None = None
 
-                def _call_llm_stream():
+                _dify_base = _dify.api_base()
+
+                def _call_llm_stream(provider: str, provider_key: str):
                     """在 executor 中调用 LLM 流式 API（Dify / DeepSeek），连接失败自动重试。"""
                     import time as _t
                     import requests as _requests
                     last_exc: Exception | None = None
                     for _attempt in range(1, _cfg.LLM_RETRIES + 1):
                         try:
-                            if use_dify:
+                            if provider == "dify":
                                 _dify_user = clients.get(sid, {}).get("user_id") or sid
                                 log.info("[VC] %s | Dify HTTP POST -> %s/chat-messages (attempt %d/%d)",
-                                         sid, _cfg.DIFY_API_BASE, _attempt, _cfg.LLM_RETRIES)
+                                         sid, _dify_base, _attempt, _cfg.LLM_RETRIES)
                                 resp = _requests.post(
-                                    f"{_cfg.DIFY_API_BASE}/chat-messages",
+                                    f"{_dify_base}/chat-messages",
                                     headers={
-                                        "Authorization": f"Bearer {_api_key}",
+                                        "Authorization": f"Bearer {provider_key}",
                                         "Content-Type": "application/json",
                                     },
                                     json={
@@ -778,7 +1261,7 @@ def register_socket_events(sio, log):
                             resp = _requests.post(
                                 f"{_cfg.DEEPSEEK_BASE_URL}/chat/completions",
                                 headers={
-                                    "Authorization": f"Bearer {_api_key}",
+                                    "Authorization": f"Bearer {provider_key}",
                                     "Content-Type": "application/json",
                                 },
                                 json={
@@ -795,158 +1278,93 @@ def register_socket_events(sio, log):
                             return resp
                         except Exception as _e:
                             last_exc = _e
-                            log.warning("[VC] %s | LLM 请求第 %d/%d 次失败: %s",
-                                        sid, _attempt, _cfg.LLM_RETRIES, _e)
+                            log.warning("[VC] %s | %s 请求第 %d/%d 次失败: %s",
+                                        sid, provider, _attempt, _cfg.LLM_RETRIES, _e)
                             if _attempt < _cfg.LLM_RETRIES:
                                 _t.sleep(0.5 * _attempt)
                     raise last_exc  # type: ignore[misc]
 
-                try:
-                    resp = await loop.run_in_executor(None, _call_llm_stream)
-                except Exception as _e:
-                    log.error("[VC] %s | LLM 调用失败 (executor): %s", sid, _e)
-                    await sio.emit("vc_error", {
-                        "stage": "llm",
-                        "message": "AI 服务连接失败，请稍后重试"
-                    }, room=sid)
-                    return
-
-                if resp.status_code != 200:
-                    err_msg = f"LLM API 返回 {resp.status_code}"
-                    try:
-                        err_body_txt = resp.text
-                        log.error("[VC] %s | LLM 错误响应体: %s", sid, err_body_txt[:500])
-                        try:
-                            err_body = resp.json()
-                            err_msg = err_body.get("error", {}).get("message", err_msg)
-                        except Exception:
-                            err_msg = f"{err_msg}: {err_body_txt[:200]}"
-                    except Exception:
-                        pass
-                    log.error("[VC] %s | LLM 错误: %s", sid, err_msg)
-                    await sio.emit("vc_error", {"stage": "llm", "message": err_msg}, room=sid)
-                    return
-
-                # 解析 SSE 流
-                import json as _json
-                import time as _time
-                log.info("[VC] %s | [4/5] 开始解析 SSE 流...", sid)
-                line_count = 0
-                _llm_resp_t0 = _time.time()
-                for line in resp.iter_lines(decode_unicode=True):
-                    line_count += 1
-                    # 【关键修正】SSE 流处理中即使收到打断，也继续解析（full_response 要完整）
-                    #   只在需要触发 TTS 合成时，才根据 llm_cancelled 跳过语音
-                    if not line:
-                        continue
-                    if not line.startswith("data: "):
-                        # SSE 中非 data 行（如空行/注释），忽略
-                        continue
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        log.info("[VC] %s | SSE 收到 [DONE], 共 %d 行, %d tokens",
-                                 sid, line_count, token_count)
+                # 供应商顺序：配置了 Dify 就优先走 Dify；Dify 整轮没能产出任何内容时，
+                # 自动降级到 DeepSeek 重试一次，避免 Dify 工作流抖动直接掐断整通电话。
+                # （Dify 工作流的结构化输出解析失败会以 HTTP 400 或
+                #   workflow_finished=failed 返回，见 docs/dify-工作流改动说明.md）
+                _provider_plan = ["dify", "deepseek"] if use_dify else ["deepseek"]
+                _provider_errors: list[str] = []
+                _llm_is_dify = use_dify
+                # Dify 工作流自判的风险等级（拿到后补写到本轮留痕，供两侧一致性统计）
+                _dify_risk_level: str | None = None
+                for _provider in _provider_plan:
+                    if full_response.strip():
                         break
-                    try:
-                        chunk_data = _json.loads(data_str)
-                        if use_dify:
-                            event = chunk_data.get("event", "")
-                            if event == "message_end":
-                                _cid = chunk_data.get("conversation_id")
-                                if _cid:
-                                    session.dify_conversation_id = _cid
-                                log.info("[VC] %s | Dify message_end | conversation_id=%s",
-                                         sid, session.dify_conversation_id)
-                                break
-                            if event == "error":
-                                _err = chunk_data.get("message") or "Dify 智能体错误"
-                                log.error("[VC] %s | Dify 错误事件: %s", sid, _err)
-                                await sio.emit("vc_error", {"stage": "llm", "message": _err}, room=sid)
-                                break
-                            if event not in ("message", "agent_message"):
-                                continue
-                            token = chunk_data.get("answer") or ""
-                            if not token:
-                                continue
-                        else:
-                            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                            token = delta.get("content", "")
-                            if not token:
-                                continue
-                        token_count += 1
-                        full_response += token
-                        sentence_buffer += token
-
-                        # 推送 token 到前端
-                        await sio.emit("vc_llm_token", {"token": token}, room=sid)
-
-                        # 记录首 token 时间（量化延迟用）
-                        if _first_token_t is None:
-                            _first_token_t = _time.time()
-                            log.info("[VC] %s | [4/5] 首 token 到达（距离 HTTP 响应 %.1fs）",
-                                     sid, _first_token_t - _llm_resp_t0)
-
-                        # 检查句子边界 → 触发 TTS
-                        sentences = _split_sentences(sentence_buffer)
-                        force_tts = False
-                        force_text = ""
-                        if len(sentences) > 1:
-                            # 前面的完整句子送 TTS
-                            force_tts = True
-                            force_text = sentences[0]
-                            sentence_buffer = "".join(sentences[1:])
-                        elif len(sentence_buffer) >= _MAX_SENTENCE_LEN:
-                            # 强制分句：没标点但超过 160 字也切
-                            force_tts = True
-                            force_text = sentence_buffer[:_MAX_SENTENCE_LEN]
-                            sentence_buffer = sentence_buffer[_MAX_SENTENCE_LEN:]
-
-                        if force_tts and force_text.strip() and not session.llm_cancelled:
-                            if _first_tts_t is None:
-                                _first_tts_t = _time.time()
-                                log.info("[VC] %s | [4/5] 首次触发 TTS（首 token → 首个声音输出 %.1fs）",
-                                         sid, _first_tts_t - _first_token_t)
-                            log.info("[VC] %s | [4/5] %s分句 TTS: %s",
-                                     sid, "强制" if len(sentences) <= 1 else "标点", force_text[:40])
-
-                            await sio.emit("vc_tts_start", {"text": force_text}, room=sid)
-                            try:
-                                tts_chunk_idx = 0
-                                tts_was_cancelled_during = False
-                                async for audio_chunk in _tts.synthesize(
-                                    force_text, voice=_cfg.TTS_VOICE, rate=_cfg.TTS_RATE
-                                ):
-                                    # 关键修改：TTS 合成过程中即使被打断，也继续把当前句的音频发完
-                                    # 这样用户能完整听到这一句话，而不是只播放一半
-                                    if session.llm_cancelled:
-                                        tts_was_cancelled_during = True
-                                    tts_chunk_idx += 1
-                                    audio_b64 = _b64.b64encode(audio_chunk).decode("ascii")
-                                    await sio.emit("vc_tts_chunk", {
-                                        "data": audio_b64,
-                                        "format": "mp3",
-                                    }, room=sid)
-                                if tts_was_cancelled_during:
-                                    log.info("[VC] %s | [4/5] TTS 句完成（期间被打断，已完整合成 %d 个分片，后续只收文字不再TTS）", sid, tts_chunk_idx)
-                                else:
-                                    log.info("[VC] %s | [4/5] TTS 句完成: %d 个分片", sid, tts_chunk_idx)
-                                await sio.emit("vc_tts_done", {"text": force_text}, room=sid)
-                                # 【关键修正】即使被打断也不退出 SSE 循环！
-                                #   vc_interrupt 的唯一语义 = 停止后续 TTS 语音播放
-                                #   LLM 文字生成必须完整解析到底，保证用户能看到完整文字回复
-                                #   后续句子会因为 session.llm_cancelled=True 而自动跳过 TTS
-                                #   绝不能 break，否则 full_response 就残缺了！
-                            except Exception as e:
-                                log.warning("[VC] %s | TTS 分句失败: %s", sid, e, exc_info=True)
-                                await sio.emit("vc_error", {
-                                    "stage": "tts", "message": str(e)
-                                }, room=sid)
-
-                    except _json.JSONDecodeError:
+                    _llm_is_dify = _provider == "dify"
+                    _provider_label = "Dify" if _llm_is_dify else "DeepSeek"
+                    # Dify 工作流不稳定时先熔断，避免每轮通话都白等一次
+                    if _llm_is_dify and _dify.circuit_open():
+                        log.warning("[VC] %s | Dify 熔断中（%s），本轮跳过",
+                                    sid, _dify.circuit_reason())
+                        _provider_errors.append(f"Dify：熔断中（{_dify.circuit_reason()}）")
+                        continue
+                    _provider_key = (
+                        _cfg.DIFY_API_KEY if _llm_is_dify else _cfg.DEEPSEEK_API_KEY or ""
+                    ).strip()
+                    if not _provider_key:
+                        _provider_errors.append(f"{_provider_label}：未配置 API Key")
                         continue
 
-                log.info("[VC] %s | [4/5] SSE 解析完成, full_response 长度=%d, token_count=%d",
-                         sid, len(full_response), token_count)
+                    try:
+                        resp = await loop.run_in_executor(
+                            None, _call_llm_stream, _provider, _provider_key
+                        )
+                    except Exception as _e:
+                        log.error("[VC] %s | %s 调用失败 (executor): %s", sid, _provider_label, _e)
+                        _provider_errors.append(f"{_provider_label}：连接失败")
+                        if _llm_is_dify:
+                            _dify.record_failure()
+                        continue
+
+                    if resp.status_code != 200:
+                        err_msg = f"LLM API 返回 {resp.status_code}"
+                        try:
+                            err_body_txt = resp.text
+                            log.error("[VC] %s | %s 错误响应体: %s",
+                                      sid, _provider_label, err_body_txt[:500])
+                            try:
+                                err_body = resp.json()
+                                err_msg = err_body.get("error", {}).get("message", err_msg)
+                            except Exception:
+                                err_msg = f"{err_msg}: {err_body_txt[:200]}"
+                        except Exception:
+                            pass
+                        log.error("[VC] %s | %s 错误: %s", sid, _provider_label, err_msg)
+                        _provider_errors.append(f"{_provider_label}：{err_msg}")
+                        if _llm_is_dify:
+                            _dify.record_failure()
+                        continue
+
+                    _llm_provider = _provider_label
+                    log.info("[VC] %s | [4/5] 开始解析 %s SSE 流...", sid, _provider_label)
+                    _outcome = await _consume_llm_stream(
+                        sio, log, resp, is_dify=_llm_is_dify, sid=sid, session=session
+                    )
+                    full_response = _outcome["full_response"]
+                    sentence_buffer = _outcome["sentence_buffer"]
+                    token_count = _outcome["token_count"]
+                    _first_token_t = _outcome["first_token_t"]
+                    _first_tts_t = _outcome["first_tts_t"]
+                    _llm_resp_t0 = _outcome["resp_t0"]
+                    if _outcome.get("dify_risk_level"):
+                        _dify_risk_level = _outcome["dify_risk_level"]
+                    if _outcome["error"]:
+                        _provider_errors.append(f"{_provider_label}：{_outcome['error']}")
+                    if full_response.strip():
+                        if _llm_is_dify:
+                            _dify.record_success()
+                    elif _llm_is_dify and not session.llm_cancelled:
+                        _dify.record_failure()
+                    if not full_response.strip() and not session.llm_cancelled:
+                        log.warning("[VC] %s | %s 本轮未产出内容%s", sid, _provider_label,
+                                    "，降级到下一个供应商重试"
+                                    if _provider != _provider_plan[-1] else "")
 
                 # 处理缓冲区中剩余的文本
                 # 【关键修正】尾句是否合成TTS取决于 llm_cancelled，但无论如何文字都已在 full_response 中
@@ -978,13 +1396,27 @@ def register_socket_events(sio, log):
                          sid, _was_interrupted, len(full_response), token_count,
                          full_response[:80] if full_response else "(空)")
 
+                # Dify 自判风险等级补写留痕：等本轮快照落库后再 UPDATE 该行，
+                # 这样"平台四级 vs Dify 三级"的一致性统计才有数据可比。
+                if _dify_risk_level:
+                    log.info("[VC] %s | 收到 Dify 自判风险等级: %s（补写本轮留痕）",
+                             sid, _dify_risk_level)
+                    spawn_task(
+                        _backfill_dify_risk(_snapshot_task, sid, _dify_risk_level),
+                        name=f"dify-risk:{sid}",
+                    )
+
                 if not full_response.strip():
                     # 只有"完全没生成内容"才报错（真·空回复才是配置问题）
                     if not _was_interrupted:
-                        log.warning("[VC] %s | LLM 返回空内容（非打断导致）！", sid)
+                        _detail = "；".join(_provider_errors) if _provider_errors else ""
+                        log.warning("[VC] %s | LLM 返回空内容（非打断导致）！%s", sid, _detail)
                         await sio.emit("vc_error", {
-                            "stage": "llm_empty",
-                            "message": "AI 回复为空，请检查 API Key 是否有效或额度是否充足"
+                            "stage": "llm" if _provider_errors else "llm_empty",
+                            "message": (
+                                f"AI 回复为空（{_detail}）"
+                                if _detail else "AI 回复为空，请检查 API Key 是否有效或额度是否充足"
+                            ),
                         }, room=sid)
                     else:
                         log.info("[VC] %s | LLM 被打断时还没生成内容（正常）", sid)
@@ -992,13 +1424,55 @@ def register_socket_events(sio, log):
                     # 不管有没有被打断，只要生成了内容，就 emit 给前端显示
                     await sio.emit("vc_llm_done", {"full_response": full_response}, room=sid)
                     session.add_chat_message("assistant", full_response)
-                    if _persist_uid and _persist_conv:
-                        try:
-                            from app.services.ai_conversation_service import append_ai_message
-                            async with AsyncSessionLocal() as db:
-                                await append_ai_message(db, _persist_conv, "ASSISTANT", full_response)
-                        except Exception as _e:
-                            log.warning("[VC] %s | AI 回复持久化失败: %s", sid, _e)
+
+                    # ── 5) 会话留痕：补齐本轮 AI 回复与分段耗时 ──────────
+                    #   尽力而为：写库失败只记日志，不影响用户体验（见 ai_conversation_service）。
+                    session.turn_index += 1
+                    _stage_ctx = session.stage_context
+                    _now_ts = _time.time()
+                    _turn_timings: dict[str, float] = {
+                        "asr_seconds": _asr_seconds,
+                        "multimodal_seconds": round(_mm_elapsed, 3),
+                        "e2e_seconds": round(_now_ts - _turn_t0, 3),
+                    }
+                    if _llm_resp_t0:
+                        _turn_timings["llm_total_seconds"] = round(_now_ts - _llm_resp_t0, 3)
+                        if _first_token_t:
+                            _turn_timings["llm_first_token_seconds"] = round(
+                                _first_token_t - _llm_resp_t0, 3
+                            )
+                    if _first_token_t and _first_tts_t:
+                        _turn_timings["tts_first_audio_seconds"] = round(
+                            _first_tts_t - _first_token_t, 3
+                        )
+                    spawn_task(_conversation.record_message_safely(
+                        session.conversation_id,
+                        role="ASSISTANT",
+                        content=full_response,
+                        turn_index=session.turn_index,
+                        snapshot=_conversation.TurnSnapshot(
+                            turn_index=session.turn_index,
+                            user_text=asr_text,
+                            assistant_text=full_response,
+                            stage=_stage_ctx.get("stage"),
+                            goal_clear=_stage_ctx.get("goal_clear"),
+                            action_ready=_stage_ctx.get("action_ready"),
+                            should_summarize=_stage_ctx.get("should_summarize"),
+                            summary_reason=_stage_ctx.get("summary_reason"),
+                            risk_level=_risk.level,
+                            risk_score=_risk.risk_score,
+                            fusion_emotion=session.emotion_context.get("fusion_emotion_en"),
+                            fusion_confidence=session.emotion_context.get("fusion_confidence"),
+                            timings=_turn_timings,
+                        ),
+                        timings=_turn_timings,
+                    ), name=f"record-assistant:{sid}")
+                    log.info(
+                        "[VC] %s | [5/5] 会话留痕 turn=%d conversation=%s | 耗时 %s",
+                        sid, session.turn_index, session.conversation_id,
+                        {k: v for k, v in _turn_timings.items()},
+                    )
+
                     if _was_interrupted:
                         log.info("[VC] %s | <<< 管线结束（被打断，已保存 %d 字内容）", sid, len(full_response))
                     else:
@@ -1024,49 +1498,157 @@ def register_socket_events(sio, log):
             # 如果会话已结束（用户点了结束通话），不再发 listening 覆盖 idle
             if session.state == realtime_session.STATE_IDLE:
                 log.info("[VC] %s | 管线结束，但会话已关闭，跳过状态重置", sid)
-                return
-            # 回到监听状态
-            session.state = realtime_session.STATE_LISTENING
-            await sio.emit("vc_state_change", {"state": "listening"}, room=sid)
-            session.reset_interrupt()
-            log.info("[VC] %s | 状态重置 -> listening", sid)
+            else:
+                # 回到监听状态
+                session.state = realtime_session.STATE_LISTENING
+                await sio.emit("vc_state_change", {"state": "listening"}, room=sid)
+                session.reset_interrupt()
+                log.info("[VC] %s | 状态重置 -> listening", sid)
 
     # ─── vc_start: 开始视频通话会话 ─────────────────────────────
     @sio.on("vc_start")
     async def handle_vc_start(sid, data=None):
+
         from app.services.ai_lab import realtime_session
+        from app.services import ai_conversation_service as _conversation_start
+
         session = realtime_session.get_session(sid)
         session.state = realtime_session.STATE_LISTENING
-        # 持久化：新建 / 复用 ACTIVE 会话
-        _uid = clients.get(sid, {}).get("user_id")
-        if _uid:
-            try:
-                from app.services.ai_conversation_service import get_or_create_active_conversation
-                async with AsyncSessionLocal() as db:
-                    conv = await get_or_create_active_conversation(db, _uid)
-                clients[sid]["ai_conv_id"] = conv.id
-                log.info("[VC] %s | AI 会话已就绪 conv=%s", sid, conv.id)
-                await sio.emit("vc_conversation_ready", {"conversationId": conv.id}, room=sid)
-            except Exception as _e:
-                log.warning("[VC] %s | AI 会话初始化失败: %s", sid, _e)
-        log.info("[VC] %s | 视频通话开始", sid)
+        session.touch()  # 通话开始即视为一次语音活动，空闲计时重新起算
+
+        # 开会话 + 写授权存证（尽力而为：失败只记日志，不影响通话）
+        payload = data if isinstance(data, dict) else {}
+        consent = payload.get("consent")
+        if not isinstance(consent, dict):
+            # 旧客户端不传授权范围：保持"全模态"行为不变，
+            # 但在存证里标明这是缺省授权，避免把默认值当成用户勾选。
+            consent = {
+                "mic": True,
+                "camera": True,
+                "multimodal": True,
+                "basis": "legacy-client-default",
+            }
+        # 授权范围决定管线用哪些模态：未授权摄像头则不接收画面帧，
+        # 未授权多模态则不把语音语调与面部计入情绪融合（缺省全开，兼容旧客户端）。
+        if consent:
+            session.consent_camera = bool(consent.get("camera", True))
+            session.consent_multimodal = bool(consent.get("multimodal", True))
+        if session.conversation_id is None:
+            session.conversation_id = await _conversation_start.start_session_safely(
+                user_id=clients.get(sid, {}).get("user_id"),
+                client_session_id=sid,
+                consent=consent,
+            )
+        if session.conversation_id:
+            clients.setdefault(sid, {})["ai_conv_id"] = session.conversation_id
+        log.info("[VC] %s | 视频通话开始 | 会话=%s", sid, session.conversation_id)
         await sio.emit("vc_state_change", {"state": "listening"}, room=sid)
+        if session.conversation_id:
+            await sio.emit("vc_session_started", {
+                "sessionId": session.conversation_id,
+                "stage": "opening",
+                "consent": {
+                    "mic": True,
+                    "camera": session.consent_camera,
+                    "multimodal": session.consent_multimodal,
+                },
+            }, room=sid)
+            # 前端据此把"结束通话 → 记录情绪日记"关联到本次会话
+            await sio.emit("vc_conversation_ready", {
+                "conversationId": session.conversation_id,
+            }, room=sid)
+
+    # ─── vc_consent: 通话中变更授权范围（开启 / 撤回摄像头、多模态）─────
+    @sio.on("vc_consent")
+    async def handle_vc_consent(sid, data=None):
+        """用户在通话过程中重新授权或撤回授权。
+
+        前端每次拨动「摄像头」「多模态线索」开关都会调用一次，服务端据此立刻改变
+        管线行为，而不是等下一通电话：
+
+        * 撤回摄像头 → 不再接收画面帧，已缓存的面部帧立刻清空；
+        * 撤回多模态 → 语音语调与面部都不参与情绪融合，只按谈话内容判断。
+
+        每次变更都写入 ``consent_records``（撤回会补 ``revoked_at``），
+        使"什么时候授权、什么时候撤回"在伦理审核时可核对。
+        """
+
+        from app.services import ai_conversation_service as _conversation_consent
+        from app.services.ai_lab import realtime_session
+
+        if not realtime_session.has_session(sid):
+            return
+        session = realtime_session.get_session(sid)
+        session.touch()  # 用户主动改授权 = 有人在操作，空闲计时重置
+
+        payload = data if isinstance(data, dict) else {}
+        scopes = payload.get("consent") if isinstance(payload.get("consent"), dict) else payload
+        if not isinstance(scopes, dict):
+            scopes = {}
+
+        revoked: list[str] = []
+        if "camera" in scopes:
+            next_camera = bool(scopes["camera"])
+            if session.consent_camera and not next_camera:
+                revoked.append("camera")
+            session.consent_camera = next_camera
+        if "multimodal" in scopes:
+            next_multimodal = bool(scopes["multimodal"])
+            if session.consent_multimodal and not next_multimodal:
+                revoked.append("multimodal")
+            session.consent_multimodal = next_multimodal
+
+        if not session.consent_camera:
+            # 撤回即刻生效：丢弃最新帧并清空面部时序缓冲，
+            # 保证本届及后续轮次都不会用到撤回前采集的画面。
+            session.latest_frame = ""
+            session.latest_frame_ts = 0.0
+            facial_buffer.remove_client(sid)
+
+        effective = {
+            "mic": True,
+            "camera": session.consent_camera,
+            "multimodal": session.consent_multimodal,
+        }
+        log.info(
+            "[VC] %s | 授权变更: camera=%s multimodal=%s | 本次撤回=%s",
+            sid, effective["camera"], effective["multimodal"], "、".join(revoked) or "无",
+        )
+
+        consent_snapshot = {
+            **effective,
+            "basis": str(scopes.get("basis") or payload.get("basis") or "USER_TOGGLE")[:32],
+        }
+        raw_user_id = clients.get(sid, {}).get("user_id")
+        try:
+            user_id = int(raw_user_id) if raw_user_id is not None else None
+        except (TypeError, ValueError):
+            user_id = None
+        spawn_task(
+            _conversation_consent.record_consent_change_safely(
+                user_id=user_id,
+                client_session_id=sid,
+                conversation_id=session.conversation_id,
+                consent=consent_snapshot,
+                revoked_scopes=revoked,
+            ),
+            name=f"consent-record:{sid}",
+        )
+
+        await sio.emit("vc_consent_updated", {
+            "conversationId": session.conversation_id,
+            "consent": effective,
+            "revoked": revoked,
+        }, room=sid)
 
     # ─── vc_stop: 结束视频通话会话 ─────────────────────────────
     @sio.on("vc_stop")
     async def handle_vc_stop(sid, data=None):
         from app.services.ai_lab import realtime_session
+        from app.services import ai_conversation_service as _conversation_stop
+
         if not realtime_session.has_session(sid):
             return
-        _conv_id = clients.get(sid, {}).get("ai_conv_id")
-        if _conv_id:
-            try:
-                from app.services.ai_conversation_service import end_ai_conversation
-                async with AsyncSessionLocal() as db:
-                    await end_ai_conversation(db, _conv_id)
-                log.info("[VC] %s | AI 会话 %s 已结束", sid, _conv_id)
-            except Exception as _e:
-                log.warning("[VC] %s | 结束 AI 会话失败: %s", sid, _e)
         session = realtime_session.get_session(sid)
         # 彻底取消所有进行中的任务
         session.llm_cancelled = True
@@ -1075,11 +1657,22 @@ def register_socket_events(sio, log):
         # 清理累积的音频和情感数据
         session.audio_chunks.clear()
         session.emotion_result = None
-        log.info("[VC] %s | 视频通话结束（会话已清理）", sid)
+
+        # 收尾：标记数据库会话结束（失败只记日志）
+        if session.conversation_id:
+            spawn_task(
+                _conversation_stop.end_session_safely(session.conversation_id),
+                name=f"end-session:{sid}",
+            )
+            log.info("[VC] %s | 视频通话结束（会话已归档 id=%s，turn=%d）",
+                     sid, session.conversation_id, session.turn_index)
+            session.conversation_id = None
+            clients.get(sid, {}).pop("ai_conv_id", None)
+        else:
+            log.info("[VC] %s | 视频通话结束（会话已清理）", sid)
         # 通知前端状态变为 idle
         await sio.emit("vc_state_change", {"state": "idle"}, room=sid)
         # 延迟 2 秒后彻底移除会话（确保所有进行中的事件都已处理完毕）
-        import asyncio
         await asyncio.sleep(2)
         if realtime_session.has_session(sid):
             realtime_session.remove_session(sid)
@@ -1092,6 +1685,7 @@ def register_socket_events(sio, log):
         if not realtime_session.has_session(sid):
             return
         session = realtime_session.get_session(sid)
+        session.touch()  # 收到音频分片 = 用户在场，空闲计时重置
         if isinstance(data, dict):
             chunk_b64 = data.get("data", "")
         else:
@@ -1115,6 +1709,7 @@ def register_socket_events(sio, log):
         if session.state == realtime_session.STATE_IDLE:
             log.info("[VC] %s | 会话已关闭，忽略音频处理", sid)
             return
+        session.touch()  # 用户说完一轮 = 语音活动，空闲计时重置
 
         file_id = ""
         file_size = 0
@@ -1124,6 +1719,16 @@ def register_socket_events(sio, log):
 
         if not file_id:
             log.warning("[VC] %s | 缺少 file_id，忽略", sid)
+            return
+
+        # 只接受本平台生成的 32 位十六进制 file_id：
+        #   - 挡住 "../" 之类的越权路径（拼路径前先做格式校验）
+        #   - 避免把别的会话/任意本地文件当成用户音频送进 ASR
+        if not UPLOAD_FILE_ID_PATTERN.match(file_id):
+            log.warning("[VC] %s | file_id 格式非法，已拒绝: %r", sid, file_id[:64])
+            await sio.emit("vc_error", {
+                "stage": "upload", "message": "音频文件标识非法，请重新录制"
+            }, room=sid)
             return
 
         # 在上传目录中查找对应文件
@@ -1150,8 +1755,10 @@ def register_socket_events(sio, log):
             return
 
         # 异步执行管线，不阻塞 socket 事件循环
-        import asyncio
-        asyncio.ensure_future(_run_video_call_pipeline_from_file(sid, audio_path))
+        spawn_task(
+            _run_video_call_pipeline_from_file(sid, audio_path),
+            name=f"vc-pipeline:{sid}",
+        )
 
     # ─── vc_interrupt: 用户打断 ────────────────────────────────
     @sio.on("vc_interrupt")
@@ -1160,6 +1767,7 @@ def register_socket_events(sio, log):
         if not realtime_session.has_session(sid):
             return
         session = realtime_session.get_session(sid)
+        session.touch()  # 用户主动打断也是"人在场"的信号
         # 【关键修正】vc_interrupt 的唯一语义：停止后续 TTS 语音合成
         #   1. 只设置 llm_cancelled=True，让管线内的 TTS 判断跳过
         #   2. 绝对不设置 state=listening！因为 ASR/情感/LLM 还在执行！
@@ -1181,6 +1789,9 @@ def register_socket_events(sio, log):
             return
         if isinstance(data, dict) and data.get("imgBase64"):
             session = realtime_session.get_session(sid)
+            # 未授权摄像头画面时丢弃帧（前端本就不上传，这里是服务端兜底）
+            if not session.consent_camera:
+                return
             session.update_frame(data["imgBase64"])
 
     # ─── vc_update_emotion: 更新情绪上下文（从面部识别结果同步）──

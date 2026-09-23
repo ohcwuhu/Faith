@@ -1,8 +1,6 @@
 """注销删除（被遗忘权）：删除/匿名化个人数据，保留财务与履约记录。"""
 
-import os
 import secrets
-from pathlib import Path
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession

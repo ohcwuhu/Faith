@@ -21,10 +21,6 @@ def unique_phone() -> str:
     return "139" + str(int(time.time() * 1000) % 100000000).zfill(8)
 
 
-def unique_phone() -> str:
-    return "139" + str(int(time.time()) % 100000000).zfill(8)
-
-
 def delete_user_by_phone(phone: str) -> None:
     db = SessionLocal()
     try:

@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.db.session import SessionLocal
-from app.models.coach import Appointment, CoachProfile, CoachSlot, Service
+from app.models.coach import Appointment, CoachSlot
 from app.models.user import User
 from app.models.v1_1 import Order, Payment, Refund
 

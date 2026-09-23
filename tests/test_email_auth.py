@@ -85,9 +85,7 @@ def test_reset_password_by_email(client, auth_headers, captured_codes):
     assert resp.status_code == 200
 
     # 新密码可登录，旧密码失效
-    phone = auth_headers["phone"] if "phone" in auth_headers else None
-    user_resp = client.get("/api/v1/users/me", headers=auth_headers)
-    masked = user_resp.json()["data"]["phone"]
+    assert client.get("/api/v1/users/me", headers=auth_headers).status_code == 200
     # 通过注册接口拿到的手机号不可直接获得，这里用邮箱重置后验证新密码登录失败路径
     resp = client.post(
         "/api/v1/auth/reset-password",

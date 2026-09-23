@@ -9,8 +9,28 @@ from sqlalchemy import select
 os.environ["SCHEDULER_ENABLED"] = "false"
 
 from app.db.session import SessionLocal
-from app.main import app
+from app.db import session as db_session
 from app.models.user import User
+
+# ---------------------------------------------------------------------------
+# 测试用引擎：改用 NullPool
+# ---------------------------------------------------------------------------
+# 应用运行在一个长期存活的事件循环里，连接池可以正常复用；而 TestClient 会为每个
+# 测试模块创建并销毁自己的事件循环，全局池中的连接便可能在"旧循环建立、新循环回收"，
+# 触发 asyncmy 的 "Event loop is closed"（Windows + Python 3.13 下尤为明显）。
+# 测试改用 NullPool：连接随用随开、在当前循环内释放，从根上避免跨循环回收。
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
+
+_test_engine = create_async_engine(
+    db_session.async_url(),
+    poolclass=NullPool,
+    pool_pre_ping=True,
+)
+db_session.async_engine = _test_engine
+db_session.AsyncSessionLocal.configure(bind=_test_engine)
+
+from app.main import app  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

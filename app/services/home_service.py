@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.coach import CoachProfile, CoachTag, Tag
 from app.models.content import Article, Banner
 from app.models.user import User
-from app.services.article_service import article_to_out, get_favorite_ids
+# 首页路由通过本模块取用文章转换函数（历史调用约定），保留为再导出
+from app.services.article_service import article_to_out, get_favorite_ids  # noqa: F401
 
 QUICK_ENTRIES = [
     {"key": "self_coaching", "title": "自我教练", "icon": "self-coaching", "path": "/self-coaching"},

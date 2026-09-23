@@ -1,0 +1,88 @@
+{
+  "totals": {
+    "analyses": 0,
+    "sampled": 0,
+    "status": {},
+    "okRate": 0.0,
+    "partialSuccessRate": 0.0,
+    "failedRate": 0.0
+  },
+  "degradation": {
+    "analysesWithAdjustment": 0,
+    "rate": 0.0,
+    "topReasons": []
+  },
+  "modalities": {
+    "missingFacialRate": 0.0,
+    "missingVoiceRate": 0.0,
+    "shortTextRate": 0.0
+  },
+  "latency": {
+    "sampled": 0,
+    "metrics": {
+      "asr_seconds": {
+        "samples": 0,
+        "p50": null,
+        "p95": null
+      },
+      "multimodal_seconds": {
+        "samples": 0,
+        "p50": null,
+        "p95": null
+      },
+      "llm_first_token_seconds": {
+        "samples": 0,
+        "p50": null,
+        "p95": null
+      },
+      "llm_total_seconds": {
+        "samples": 0,
+        "p50": null,
+        "p95": null
+      },
+      "tts_first_audio_seconds": {
+        "samples": 0,
+        "p50": null,
+        "p95": null
+      },
+      "e2e_seconds": {
+        "samples": 0,
+        "p50": null,
+        "p95": null
+      }
+    }
+  },
+  "risk": {
+    "platform": {
+      "distribution": {},
+      "flagged": 0,
+      "flaggedRate": 0.0
+    },
+    "dify": {
+      "distribution": {},
+      "flagged": 0,
+      "flaggedRate": 0.0
+    },
+    "consistency": {
+      "comparable": 0,
+      "matched": 0,
+      "rate": null
+    }
+  },
+  "stages": {
+    "distribution": {},
+    "rate": {}
+  },
+  "coaching": {
+    "sessions": 2,
+    "messages": 2,
+    "distinctUsers": 1
+  },
+  "daily": [],
+  "range": {
+    "days": 30,
+    "from": "2026-08-22",
+    "to": "2026-09-21",
+    "source": null
+  }
+}

@@ -1,5 +1,12 @@
 # 仅用于工具配置（本项目不是可安装包，运行方式见 README）
 
+[tool.pytest.ini_options]
+# 让 `pytest` 与 `python -m pytest` 行为一致：两者都要能 import app.*
+# （`pytest` 入口不会把当前目录放进 sys.path，CI 里因此报
+#   ModuleNotFoundError: No module named 'app'）
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"

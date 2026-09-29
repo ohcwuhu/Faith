@@ -1,0 +1,2 @@
+# 知识库检索索引目录。
+# 跑 `python scripts/build_kb_index.py` 会在这里生成 kb_index.pkl（约 17 MB）。

@@ -1,0 +1,40 @@
+{"id": "S01", "gold": "sad", "note": "三模态一致的低落", "text": ["sad", 0.82], "voice": ["sad", 0.74], "facial": ["sad", 0.68, 14]}
+{"id": "S02", "gold": "happy", "note": "三模态一致的正向", "text": ["happy", 0.88], "voice": ["happy", 0.79], "facial": ["happy", 0.85, 18]}
+{"id": "S03", "gold": "fearful", "note": "三模态一致的紧张", "text": ["fearful", 0.71], "voice": ["fearful", 0.76], "facial": ["fearful", 0.63, 12]}
+{"id": "S04", "gold": "neutral", "note": "三模态一致的平静", "text": ["neutral", 0.69], "voice": ["neutral", 0.72], "facial": ["neutral", 0.74, 20]}
+{"id": "S05", "gold": "angry", "note": "三模态一致的愤怒", "text": ["angry", 0.75], "voice": ["angry", 0.70], "facial": ["angry", 0.66, 11]}
+{"id": "S06", "gold": "sad", "note": "言语否认难受但副语言一致指向低落（多模态应优于纯文本）", "text": ["neutral", 0.66], "voice": ["sad", 0.81], "facial": ["sad", 0.72, 16]}
+{"id": "S07", "gold": "neutral", "note": "转述悲伤事件但情绪平稳（纯文本易误判）", "text": ["sad", 0.64], "voice": ["neutral", 0.70], "facial": ["neutral", 0.68, 15]}
+{"id": "S08", "gold": "fearful", "note": "口头平静但语调与表情一致紧张", "text": ["neutral", 0.61], "voice": ["fearful", 0.77], "facial": ["fearful", 0.69, 13]}
+{"id": "S09", "gold": "happy", "note": "言语积极、语调与表情一致", "text": ["happy", 0.73], "voice": ["happy", 0.68], "facial": ["happy", 0.80, 19]}
+{"id": "S10", "gold": "neutral", "note": "内容消极但表达平稳", "text": ["sad", 0.58], "voice": ["neutral", 0.66], "facial": ["neutral", 0.71, 17]}
+{"id": "S11", "gold": "sad", "note": "摄像头未开启，文本与语调一致", "text": ["sad", 0.79], "voice": ["sad", 0.73], "facial": []}
+{"id": "S12", "gold": "happy", "note": "摄像头未开启，文本与语调一致", "text": ["happy", 0.84], "voice": ["happy", 0.71], "facial": []}
+{"id": "S13", "gold": "neutral", "note": "摄像头未开启，内容与语调平稳", "text": ["neutral", 0.70], "voice": ["neutral", 0.68], "facial": []}
+{"id": "S14", "gold": "fearful", "note": "摄像头未开启，语调明显紧张", "text": ["fearful", 0.66], "voice": ["fearful", 0.74], "facial": []}
+{"id": "S15", "gold": "angry", "note": "摄像头未开启，语调愤怒", "text": ["angry", 0.72], "voice": ["angry", 0.69], "facial": []}
+{"id": "S16", "gold": "neutral", "note": "摄像头未开启，文本偏负但语调平稳", "text": ["sad", 0.55], "voice": ["neutral", 0.72], "facial": []}
+{"id": "S17", "gold": "sad", "note": "语调置信度低，文本与表情一致", "text": ["sad", 0.80], "voice": ["fearful", 0.33], "facial": ["sad", 0.67, 14]}
+{"id": "S18", "gold": "happy", "note": "语调置信度低，文本与表情一致", "text": ["happy", 0.81], "voice": ["neutral", 0.31], "facial": ["happy", 0.74, 16]}
+{"id": "S19", "gold": "neutral", "note": "语调置信度低，文本中性", "text": ["neutral", 0.68], "voice": ["angry", 0.29], "facial": ["neutral", 0.66, 12]}
+{"id": "S20", "gold": "sad", "note": "语音转写很短，面部与语调一致", "text": ["neutral", 0.44], "voice": ["sad", 0.75], "facial": ["sad", 0.70, 15], "text_len": 4}
+{"id": "S21", "gold": "neutral", "note": "语音转写很短，其他模态平稳", "text": ["happy", 0.40], "voice": ["neutral", 0.70], "facial": ["neutral", 0.69, 14], "text_len": 3}
+{"id": "S22", "gold": "disgusted", "note": "三模态一致的厌恶", "text": ["disgusted", 0.70], "voice": ["disgusted", 0.62], "facial": ["disgusted", 0.65, 10]}
+{"id": "S23", "gold": "surprised", "note": "三模态一致的惊讶", "text": ["surprised", 0.68], "voice": ["surprised", 0.64], "facial": ["surprised", 0.72, 9]}
+{"id": "S24", "gold": "neutral", "note": "面部稳定性差（帧数少）时不应被视觉主导", "text": ["neutral", 0.72], "voice": ["neutral", 0.66], "facial": ["angry", 0.55, 2]}
+{"id": "S25", "gold": "sad", "note": "文本与语调一致低落，面部帧数少", "text": ["sad", 0.77], "voice": ["sad", 0.70], "facial": ["neutral", 0.48, 1]}
+{"id": "S26", "gold": "happy", "note": "正向表达，三模态一致", "text": ["happy", 0.86], "voice": ["happy", 0.72], "facial": ["happy", 0.78, 17]}
+{"id": "S27", "gold": "fearful", "note": "文本与语调紧张，面部中性", "text": ["fearful", 0.69], "voice": ["fearful", 0.71], "facial": ["neutral", 0.60, 13]}
+{"id": "S28", "gold": "neutral", "note": "三模态一致平静", "text": ["neutral", 0.74], "voice": ["neutral", 0.69], "facial": ["neutral", 0.72, 21]}
+{"id": "S29", "gold": "sad", "note": "文本中性但语调与面部一致低落", "text": ["neutral", 0.58], "voice": ["sad", 0.78], "facial": ["sad", 0.66, 15]}
+{"id": "S30", "gold": "angry", "note": "文本与面部愤怒，语调中立", "text": ["angry", 0.74], "voice": ["neutral", 0.61], "facial": ["angry", 0.63, 12]}
+{"id": "S31", "gold": "fearful", "sv": "fearful", "note": "文本与语调接近，SenseVoice 与 emotion2vec 一致时语调权重上调", "text": ["sad", 0.53], "voice": ["fearful", 0.51], "facial": ["fearful", 0.55, 12]}
+{"id": "S32", "gold": "neutral", "sv": "neutral", "note": "置信度接近的三方分歧，检验权重再分配方向", "text": ["sad", 0.48], "voice": ["neutral", 0.47], "facial": ["neutral", 0.52, 13]}
+{"id": "S33", "gold": "sad", "sv": "neutral", "note": "文本与语调接近且一致低落", "text": ["sad", 0.61], "voice": ["sad", 0.58], "facial": ["neutral", 0.62, 16]}
+{"id": "S34", "gold": "fearful", "sv": "fearful", "note": "语调与表情一致紧张，文本偏中性", "text": ["neutral", 0.64], "voice": ["fearful", 0.59], "facial": ["fearful", 0.61, 14]}
+{"id": "S35", "gold": "neutral", "sv": "neutral", "note": "语调置信度低且与文本冲突", "text": ["neutral", 0.63], "voice": ["angry", 0.36], "facial": [], "text_len": 24}
+{"id": "S36", "gold": "sad", "sv": "neutral", "note": "摄像头未开启、置信度接近的文本-语调冲突", "text": ["sad", 0.54], "voice": ["fearful", 0.49], "facial": []}
+{"id": "S37", "gold": "fearful", "sv": "fearful", "note": "言语偏难过、语调与语音情绪一致紧张，人工标注为恐惧（动态权重应受益于一致性加权）", "text": ["sad", 0.50], "voice": ["fearful", 0.50], "facial": ["neutral", 0.70, 14]}
+{"id": "S38", "gold": "fearful", "sv": "fearful", "note": "摄像头未开启、语调和语音情绪一致紧张", "text": ["sad", 0.50], "voice": ["fearful", 0.50], "facial": []}
+{"id": "S39", "gold": "fearful", "sv": "neutral", "note": "言语表达愤怒但语调与表情一致畏缩，人工标注为恐惧；动态权重在该场景弱于固定权重，作为已知偏差保留", "text": ["angry", 0.60], "voice": ["fearful", 0.50], "facial": ["fearful", 0.55, 10]}
+{"id": "S40", "gold": "sad", "sv": "sad", "note": "言语表达愤怒但语调低落，语音情绪与语调一致", "text": ["angry", 0.60], "voice": ["sad", 0.55], "facial": ["neutral", 0.70, 14]}

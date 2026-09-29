@@ -1,0 +1,101 @@
+# MindBasic 一键启动：MySQL + Redis + 后端 + 前端（Nginx 代理 /api 与 /socket.io）
+#
+# 首次使用：
+#   1) 生成密钥：python -c "import secrets; print(secrets.token_hex(32))"
+#   2) 在项目根目录 .env 中写入 JWT_SECRET_KEY=<上一步的输出>
+#      （README「环境变量」一节列出了全部可选项；缺失时本文件会直接报错）
+#   3) docker compose up -d --build
+#
+# 访问：前端 http://localhost:8080 ，后端 http://localhost:8000/docs
+#
+# 注意：本文件面向本地/内网演示，DEBUG=true、COOKIE_SECURE=false。
+# 生产部署必须改为 DEBUG=false + COOKIE_SECURE=true + 显式 CORS_ORIGINS，
+# 并由外层网关终结 HTTPS（见 README「部署要点」）。
+
+services:
+  mysql:
+    image: mysql:8.0
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mindbasic-root}
+      MYSQL_DATABASE: mindbasic
+      MYSQL_USER: ${MYSQL_USER:-mindbasic}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-mindbasic}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-mindbasic-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_NAME: MindBasic
+      DEBUG: "true"
+      COOKIE_SECURE: "false"
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-mindbasic}:${MYSQL_PASSWORD:-mindbasic}@mysql:3306/mindbasic?charset=utf8mb4
+      # 必须显式提供：缺失时 compose 会直接报错，避免用弱默认值启动
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?请在 .env 中设置 JWT_SECRET_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      RATE_LIMIT_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      SCHEDULER_ENABLED: "true"
+      LOG_LEVEL: INFO
+      # 以下为可选能力：在 .env 中提供后自动生效
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DIFY_API_BASE: ${DIFY_API_BASE:-}
+      DIFY_API_KEY: ${DIFY_API_KEY:-}
+      VLM_API_KEY: ${VLM_API_KEY:-}
+      VLM_BASE_URL: ${VLM_BASE_URL:-}
+      VLM_MODEL: ${VLM_MODEL:-}
+      TTS_VOICE: ${TTS_VOICE:-zh-CN-XiaoxiaoNeural}
+      FUSION_CALIBRATION_ENABLED: ${FUSION_CALIBRATION_ENABLED:-false}
+      FUSION_TEMPERATURE: ${FUSION_TEMPERATURE:-1.0}
+      FUSION_CALIBRATION_SOURCE: ${FUSION_CALIBRATION_SOURCE:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      # 留痕与上传文件需要持久化（技术报告的运行数据也来自这里）
+      - ./uploads:/app/uploads
+      # 知识库检索索引（宿主机构建后挂进容器，缺失时检索静默降级）
+      - ./data:/app/data
+      - ./exports:/app/exports
+    restart: unless-stopped
+
+  frontend:
+    build: ../MindBasic-frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:

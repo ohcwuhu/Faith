@@ -1,0 +1,23 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+sqlalchemy>=2.0.30
+alembic>=1.13.0
+pymysql>=1.1.0
+cryptography>=42.0.0
+bcrypt>=4.1.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
+PyJWT>=2.8.0
+python-multipart>=0.0.9
+# Socket.IO 服务端：app/main.py 顶层 import socketio，属于核心运行时依赖
+python-socketio>=5.11.0
+# 上游 LLM（DeepSeek / Dify）与自检脚本的 HTTP 客户端
+requests>=2.31.0
+# 知识库检索（kb_service）中文分词：实时通话的 knowledge_context 依赖它
+jieba>=0.42.1
+APScheduler>=3.10,<4
+redis>=5.0.0
+bleach>=6.0.0
+asyncmy>=0.2.9
+prometheus-client>=0.20.0

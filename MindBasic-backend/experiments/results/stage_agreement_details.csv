@@ -1,0 +1,23 @@
+﻿id,source,turn_index,utterance,expected_stage,expected_stage_cn,predicted_stage,predicted_stage_cn,stage_match,goal_clear,action_ready,should_summarize,evidence,note
+ST01,synthetic_seed,1,最近总觉得时间不够用，想找个人聊聊。,opening,开始交流,opening,开始交流,True,False,False,False,,首轮只确定主题，没有目标或行动线索
+ST02,synthetic_seed,1,你好，我想聊聊最近的状态。,opening,开始交流,opening,开始交流,True,False,False,False,,开场问候，未表达希望发生的变化
+ST03,synthetic_seed,2,这周有三门作业要交，还答应了社团的两次活动。,exploration,问题探索,exploration,问题探索,True,False,False,False,,陈述事实，没有目标与行动线索
+ST04,synthetic_seed,2,我也不知道自己想要什么，就是不太对劲。,exploration,问题探索,exploration,问题探索,True,False,False,False,,不确定表述出现，目标线索不计入
+ST05,synthetic_seed,2,其实我也说不清楚，就是最近老是提不起劲。,exploration,问题探索,exploration,问题探索,True,False,False,False,new_concern_raised,新顾虑线索，且本轮没有行动
+ST06,synthetic_seed,4,最近就是上课、作业、实习来回跑，感觉很满。,exploration,问题探索,exploration,问题探索,True,False,False,False,,持续探索，尚未形成目标
+ST07,synthetic_seed,3,但是还有一件事让我挺烦的，就是小组作业的分工。,exploration,问题探索,exploration,问题探索,True,False,False,False,new_concern_raised,顾虑线索，无目标无行动
+ST08,synthetic_seed,2,我希望这学期能把作息调整过来。,goal_setting,目标形成,goal_setting,目标形成,True,True,False,False,goal_cue:我希望,目标线索命中，尚无行动
+ST09,synthetic_seed,2,我的目标是先把毕业论文的初稿写出来。,goal_setting,目标形成,goal_setting,目标形成,True,True,False,False,goal_cue:我的目标是,目标线索命中，尚无具体行动
+ST10,synthetic_seed,2,我需要先把这学期的选课确定下来。,goal_setting,目标形成,goal_setting,目标形成,True,True,False,False,goal_cue:我需要先,目标线索命中
+ST11,synthetic_seed,2,我真正想要的是能自己安排一天的时间。,goal_setting,目标形成,goal_setting,目标形成,True,True,False,False,goal_cue:我真正想要,目标线索命中
+ST12,synthetic_seed,3,听起来挺不错的，我再想想具体怎么安排。,action_planning,行动规划,action_planning,行动规划,True,True,False,False,goal_cue:我希望；assistant_action_proposed,AI 已提出建议、用户尚未确认，球在用户这边
+ST13,synthetic_seed,3,嗯，这个方向我想过。,action_planning,行动规划,action_planning,行动规划,True,True,False,False,goal_cue:我希望；assistant_action_proposed,AI 提议后用户未给出行动，也未明确接受
+ST14,synthetic_seed,3,但是我不确定能不能坚持下来。,action_planning,行动规划,action_planning,行动规划,True,True,False,False,goal_cue:我希望；new_concern_raised；assistant_action_proposed,新顾虑撤销行动，目标仍清楚，等待继续推进
+ST15,synthetic_seed,3,我明天先把闹钟定到七点。,closing,阶段收束,closing,阶段收束,True,True,True,True,goal_cue:我希望；action_cue:我明天,目标清楚且用户自己说出下一步，可进入收束
+ST16,synthetic_seed,3,好的，我试试。,closing,阶段收束,closing,阶段收束,True,True,True,True,goal_cue:我希望；action_accepted,用户接受 AI 提议的行动，形成可执行下一步
+ST17,synthetic_seed,3,第一步先每天晚饭后复习四十分钟。,closing,阶段收束,closing,阶段收束,True,True,True,True,goal_cue:我想要；action_cue:第一步,行动线索命中，目标清楚
+ST18,synthetic_seed,3,我准备这周六下午去公园走走。,closing,阶段收束,closing,阶段收束,True,True,True,True,goal_cue:我希望；action_cue:我准备,行动线索命中，目标清楚
+ST19,synthetic_seed,3,没问题，就这么办。,closing,阶段收束,closing,阶段收束,True,True,True,True,goal_cue:我的目标是；action_accepted,短句接受线索生效
+ST20,synthetic_seed,3,好的。,exploration,问题探索,exploration,问题探索,True,False,False,False,,负例：没有目标或行动时，单纯的“好的”不应判为收束
+ST21,synthetic_seed,3,事情一件接一件，我也可以先放着不管，但放着也不安心，所以还是想理一理。,exploration,问题探索,exploration,问题探索,True,False,False,False,,负例：长段落里的“可以”不应被当成接受线索
+ST22,synthetic_seed,2,我打算这周先把简历改一遍。,goal_setting,目标形成,goal_setting,目标形成,True,True,False,False,goal_cue:我打算,目标线索命中；“这周先把”不构成行动线索

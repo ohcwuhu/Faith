@@ -1,0 +1,5 @@
+﻿label,precision,recall,f1,support
+NONE,0.875,0.875,0.875,8
+LOW,0.8,0.8,0.8,5
+MEDIUM,1.0,1.0,1.0,9
+HIGH,1.0,1.0,1.0,8

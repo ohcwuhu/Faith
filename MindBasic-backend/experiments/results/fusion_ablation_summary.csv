@@ -1,0 +1,6 @@
+﻿arm,accuracy,macro_f1,weighted_f1,ece
+text_only,0.625,0.7466,0.6128,0.2353
+voice_only,0.85,0.8668,0.8537,0.2855
+facial_only,0.65,0.7446,0.6642,0.1576
+fixed_weight,0.925,0.9413,0.9254,0.4104
+dynamic_weight,0.975,0.9712,0.9761,0.4203

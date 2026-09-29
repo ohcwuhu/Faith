@@ -1,0 +1,7 @@
+﻿metric,samples,p50,p95
+asr_seconds,0,,
+multimodal_seconds,0,,
+llm_first_token_seconds,0,,
+llm_total_seconds,0,,
+tts_first_audio_seconds,0,,
+e2e_seconds,0,,

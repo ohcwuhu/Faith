@@ -1,0 +1,4 @@
+﻿protocol,accuracy,macro_f1,ece,ece_5bins,nll,brier,mean_confidence
+uncalibrated,0.975,0.9712,0.4203,0.4203,0.6459,0.2833,0.5547
+in_sample,0.975,0.9712,0.0353,0.0258,0.0851,0.0522,0.9675
+cv_kfold,0.975,0.9712,0.0434,0.0285,0.2567,0.0639,0.9712

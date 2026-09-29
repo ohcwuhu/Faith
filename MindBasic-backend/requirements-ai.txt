@@ -1,0 +1,15 @@
+# AI 实验室重型依赖（与 requirements.txt 配合安装）
+# torch / tensorflow / tf-keras 体积较大，请按平台单独安装（示例为 CPU 版）：
+#   pip install torch torchaudio tensorflow tf-keras
+funasr>=1.4.1
+opensmile>=2.6.0
+deepface>=0.0.99
+# OpenSMILE 特征处理（opensmile_service 读 features DataFrame）
+pandas>=2.0.0
+# 文本情感分析（text_emotion_service）依赖 transformers；
+# 该依赖此前缺失，按 README 安装会导致 mDeBERTa 服务无法启动
+transformers>=4.40.0
+opencv-python>=4.9.0
+imageio-ffmpeg>=0.6.0
+soundfile>=0.13.0
+edge-tts>=6.1.0

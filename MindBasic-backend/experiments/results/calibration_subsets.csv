@@ -1,0 +1,7 @@
+﻿subset,samples,accuracy,raw_confidence,raw_ece,global_t_confidence,global_t_ece,own_t,own_ece,own_nll
+全部样本,40,0.975,0.5547,0.4203,0.9636,0.0357,0.0515,0.0434,0.2567
+agreement,10,1.0,0.734,0.266,1.0,0.0,0.01,0.0,0.0
+modality_conflict,25,0.96,0.4484,0.5116,0.9418,0.0571,0.0515,0.0806,0.4234
+missing_facial,9,1.0,0.5659,0.4341,0.9576,0.0424,-,样本不足,-
+low_voice_confidence,4,1.0,0.545,0.455,1.0,0.0,-,样本不足,-
+short_text,2,1.0,0.579,0.421,1.0,0.0,-,样本不足,-

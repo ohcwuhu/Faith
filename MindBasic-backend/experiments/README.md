@@ -8,7 +8,7 @@
 ## 快速开始
 
 ```bash
-cd backend
+cd MindBasic-backend
 python experiments/run_fusion_ablation.py
 python experiments/run_crisis_eval.py
 python experiments/run_calibration.py

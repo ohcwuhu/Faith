@@ -63,12 +63,12 @@ flowchart TB
     DB[("MySQL 8")]
 
     UI --> REST
-    VCP -- "音频" --> PIPE
-    VCP -- "画面帧" --> REST
+    VCP -- "音频上传" --> REST
+    VCP -- "画面帧 / 通话事件" --> PIPE
     PIPE --> ASR
     ASR --> VOICE
     ASR --> TEXT
-    REST --> FACE
+    PIPE --> FACE
     PIPE --> KB
     VOICE --> FUSE
     TEXT --> FUSE
@@ -123,7 +123,7 @@ AI 模型**懒加载 + 启动后台预热**，四个模型常驻进程内，因�
 | 组件 | 选型 |
 | --- | --- |
 | 框架 / 构建 | Vue 3（Composition API）+ Vite 6 + TypeScript |
-| 样式 | Tailwind CSS v4（`@theme` 设计令牌，松绿 + 中性灰体系） |
+| 样式 | Tailwind CSS v4（`@theme` 设计令牌，暖米底 + 深紫罗兰主色，含深色模式） |
 | 状态 / 路由 | Pinia + Vue Router 4（鉴权守卫 + 页面级懒加载） |
 | HTTP / 实时 | axios（Token 注入、401 自动刷新重放）+ socket.io-client |
 | 其他 | @phosphor-icons/vue、html-to-image、自研 XSS 安全 Markdown 渲染 |
@@ -304,7 +304,8 @@ python scripts/build_kb_index.py   # 构建知识库检索索引（需自备语�
 
 通话时的"参考资料"来自平台自建的本地检索，**不依赖 Dify 的知识库**：
 **jieba 分词 + BM25 召回 → DeepSeek 查询扩展与重排**，纯本地计算，零 embedding 调用。
-索引构建约 9 秒，运行时与多模态分析并发执行，索引缺失时静默降级（只是本轮不带参考资料）。
+索引在本地构建一次即可长期复用，运行时与多模态分析并发执行；
+索引缺失时静默降级——不报错，只是本轮不带参考资料。
 
 详见 [`docs/知识库检索方案.md`](MindBasic-backend/docs/知识库检索方案.md) 与
 [`docs/知识库上传与部署指南.md`](MindBasic-backend/docs/知识库上传与部署指南.md)。

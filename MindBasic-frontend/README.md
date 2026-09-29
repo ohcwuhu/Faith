@@ -1,10 +1,12 @@
-# MindBasic 前端（Web）
+# Faith 前端（Web）
 
-心理教练成长服务平台（MindBasic）的响应式 Web 前端：移动端优先、桌面可用，
+Faith 心理教练成长服务平台的响应式 Web 前端：移动端优先、桌面可用，
 覆盖用户端自助工具、教练端工作台、管理后台，以及内嵌的 **AI 实验室**
 （实时表情识别、语音转文字、AI 心理教练对话）。
 
-后端仓库：`MindBasic-backend`（FastAPI，开发地址 `http://127.0.0.1:8000`）。
+本目录是 monorepo `Faith` 的前端部分，后端在同仓库的 `MindBasic-backend/`
+（FastAPI，开发地址 `http://127.0.0.1:8000`）；仓库整体说明见
+[根 README](../README.md)。
 
 ## 技术栈
 
@@ -26,12 +28,12 @@
 - Node.js 18+
 - npm（或 pnpm/yarn）
 - 后端服务运行在 `127.0.0.1:8000`，且必须通过 `app.main:socket_app` 启动
-  （AI 实验室需要 SocketIO，见 `backend/README.md`）
+  （AI 实验室需要 SocketIO，见 [`MindBasic-backend/README.md`](../MindBasic-backend/README.md)）
 
 ## 快速开始
 
 ```bash
-cd frontend
+cd MindBasic-frontend
 npm install
 npm run dev        # http://127.0.0.1:5173，/api 与 /socket.io 自动代理到 8000
 npm run build      # vue-tsc 类型检查 + vite 构建 → dist/
@@ -56,8 +58,9 @@ frontend/
 │   ├── components/
 │   │   ├── admin/         # 管理后台组件（ConfirmDialog、PaginationBar、StatusBadge…）
 │   │   ├── ai-lab/        # AI 实验室组件
-│   │   │   └── VideoCallPanel.vue      # 视频通话面板
-│   │   └── …              # 通用组件（ErrorBanner、FieldInput、EmptyState、Reveal…）
+│   │   │   ├── VideoCallPanel.vue      # 视频通话面板（TTS 播放、打断、静音自动收尾）
+│   │   │   └── CompanionSprite.vue     # 陪伴形象（呼吸 / 说话动画）
+│   │   └── …              # 通用组件（ErrorBanner、FieldInput、EmptyState、Reveal、MoodFace…）
 │   ├── stores/auth.ts     # Pinia：token / user / 登录、注册、邮箱登录、登出
 │   ├── router/index.ts    # 路由表 + 鉴权守卫
 │   ├── styles/main.css    # Tailwind 主题令牌与全局工具类
@@ -79,35 +82,60 @@ frontend/
 | --- | --- | --- |
 | `/` | 首页（轮播、四宫格、推荐） | 公开 |
 | `/login` / `/register` / `/forgot-password` | 登录 / 注册 / 找回密码 | 公开 |
-| `/self-coaching` `/self-coaching/records/:id` | 自我教练（AI 视频通话）/ 记录详情 | 登录 |
-| `/emotion-journal` | 情绪日记（表情选择 + 月度心情日历） | 登录 |
-| `/coaches` `/coaches/:id` `/coaches/:id/book` | 找教练 / 详情 / 预约 | 列表详情公开，预约登录 |
-| `/articles` `/articles/:id` | 科普中心 / 文章详情 | 公开 |
-| `/my` `/profile` `/notifications` `/wallet` | 我的成长 / 个人资料 / 通知 / 我的钱包 | 登录 |
 | `/terms` | 服务协议与免责声明 | 公开 |
+| `/articles` `/articles/:id` | 科普中心 / 文章详情 | 公开 |
+| `/coaches` `/coaches/:id` | 找教练 / 教练详情 | 公开 |
+| `/coaches/:id/book` | 预约教练 | 登录 |
+| `/self-coaching` | 自我教练（AI 视频通话） | 登录 |
+| `/self-coaching/history` `/self-coaching/history/:id` | 自我教练对话历史 / 历史详情 | 登录 |
+| `/self-coaching/records/:id` | 自我教练记录详情 | 登录 |
+| `/emotion-journal` | 情绪日记（表情选择 + 月度心情日历） | 登录 |
+| `/my` `/profile` `/notifications` `/wallet` | 我的成长 / 个人资料 / 通知 / 我的钱包 | 登录 |
+| `/messages` | 与教练的沟通对话 | 登录 |
 | `/growth-assessment` | 成长测评 | 登录 |
-| `/communities` `/communities/:id` `/communities/:id/posts/:postId` | 社群广场 / 详情 / 帖子详情 | 广场公开，其余登录 |
+| `/communities` `/communities/:id` | 社群广场 / 社群详情 | 公开 |
+| `/communities/:communityId/posts/:postId` | 帖子详情 | 登录 |
 | `/coach` | 教练工作台 | 登录（教练） |
-| `/video-call` | 跳转 `/self-coaching` | - |
-| `/admin` | 管理后台 | 登录 + ADMIN |
+| `/coach/messages` | 教练端沟通对话 | 登录（教练） |
+| `/video-call` | 重定向到 `/self-coaching` | — |
+| `/admin` | 管理后台（概览 / 用户 / 审核 / 内容 / 订单 / 危机 / 审计 / 配置） | 登录 + ADMIN |
+| `/:pathMatch(.*)*` | 未匹配路径重定向到首页 | — |
 
 路由守卫：`meta.auth` 未登录跳登录页（带回跳地址）；`meta.admin` 非管理员回首页。
 
 ## 设计系统（保持一致的视觉语言）
 
-在 `src/styles/main.css` 定义，页面应沿用这些令牌而非硬编码颜色：
+在 `src/styles/main.css` 用 Tailwind v4 的 `@theme` 定义，页面应沿用这些令牌而非硬编码颜色。
+视觉语言是**暖米底 + 深紫罗兰**，并带一套对应的深色模式（同一批变量名，在深色媒体查询里
+整体替换为紫近黑底 + 提亮紫罗兰）。
+
+浅色模式：
 
 | 令牌 | 值 | 用途 |
 | --- | --- | --- |
-| `paper` | `#f4f5f2` | 页面底色 |
-| `card` | `#ffffff` | 卡片/表单 |
-| `ink` / `ink-soft` / `ink-faint` | 深/中/浅灰 | 文字层级 |
-| `hairline` | `#e2e3dd` | 分割线/描边 |
-| `pine` / `pine-deep` / `pine-soft` | 品牌绿 | 主操作/选中/浅底 |
+| `paper` | `#ebe9e2` | 页面底色（暖米底，托住紫） |
+| `paper-2` | `#e2dfd6` | 更深暖底，分区与卡内底纹 |
+| `card` | `#fbf9f4` | 卡片 / 表单（暖象牙白） |
+| `ink` / `ink-soft` / `ink-faint` | `#2b2833` / `#68646f` / `#9a96a2` | 正文 / 次级 / 弱提示 |
+| `hairline` | `#dcd7dd` | 分割线与描边 |
+| `pine` / `pine-deep` / `pine-soft` | `#6b5b95` / `#564a7a` / `#e7e2f1` | **品牌主色（深紫罗兰）**：主操作 / 悬停 / 浅填充 |
+| `lilac` / `lilac-deep` / `lilac-soft` | `#7e8baa` / `#66749a` / `#e3e8f0` | 陪伴与 AI 相关的雾蓝 |
+| `gold` / `gold-deep` / `gold-soft` | `#a6abc0` / `#7c8298` / `#eceef4` | 中性偏冷的辅助色 |
+| `sage` | `#8c977a` | 哑光苔绿，仅用于平静 / 自然类点缀 |
+| `blush` / `sand` / `glow` | `#ddd2ea` / `#e6dfd0` / `#e6e0f0` | 温度色、底纹与呼吸光球 |
 
-常用工具类：`.card`（圆角卡片）、`.catalog-tab`（等宽角标）、`.pressable`（按压反馈）。
-交互规范：主按钮全圆角 pine、卡片圆角 14px、分隔用 hairline、避免装饰性渐变/玻璃拟态；
-AI 页面同样遵守该体系（松绿强调 + Phosphor 图标 + 对比度 AA）。
+> 变量名 `pine` 是历史遗留（早期是松绿），现在对应**深紫罗兰**主色，改名会波及全部页面，
+> 因此保留变量名、以本文档为准。
+
+字体令牌：`font-sans`（PingFang SC / 微软雅黑 / Noto Sans CJK）、
+`font-serif`（Newsreader / 思源宋体）、`font-hand`（霞鹜文楷 / 楷体）、`font-mono`。
+
+常用工具类：`.card`（圆角 **24px** 卡片，带柔和投影）、`.catalog-tab`（等宽角标）、
+`.pressable`（按压反馈）、`.pill`、`.quote-block`、`.reveal`、`.breath-orb`。
+另有 `.theme-toggle` 提供明暗切换。
+
+交互规范：主按钮全圆角、卡片圆角 24px、分隔用 `hairline`、避免装饰性渐变与玻璃拟态；
+AI 页面同样遵守该体系（紫罗兰强调 + Phosphor 图标 + 文本对比度达 AA）。
 
 ## API 调用约定
 
@@ -137,28 +165,44 @@ await post('/appointments', { ... })
 | --- | --- |
 | `components/ai-lab/VideoCallPanel.vue` | 视频通话面板（TTS 播放、打断、音量可视化） |
 
-AI 实验室接口（与业务接口不同，返回自有 JSON 结构）：
+前端当前只调用一个 AI 实验室 HTTP 接口（与业务接口不同，返回自有 JSON 结构）：
 
 | 接口 | 说明 |
 | --- | --- |
-| `POST /api/analyze_audio` | 上传音频 → 转写 + 文本/语调/面部/融合情绪 |
-| `GET /api/analyze_audio/config_check` | 查看四个模型加载状态 |
-| `POST /api/analyze_audio/warmup` | 手动触发模型预热 |
-| `POST /api/ai_coach/chat` | AI 心理教练对话（携带识别上下文） |
-| `POST /api/vc_audio_upload` | 视频通话音频上传（返回 `file_id` 交 `vc_audio_end` 处理） |
+| `POST /api/vc_audio_upload` | 通话音频上传（`multipart/form-data`，返回 `file_id`），随后由 `vc_audio_end` 把 `file_id` 交给后端处理 |
 
-SocketIO 事件：
+后端另外提供了 `POST /api/analyze_audio`（离线音频 → 转写 + 多模态融合）、
+`GET /api/analyze_audio/config_check`（模型加载状态）、`POST /api/analyze_audio/warmup`
+（手动预热）与 `POST /api/ai_coach/chat`（文字教练对话）。**这几个接口供脚本与联调使用，
+当前前端页面并未调用**，调试时用 curl 或 `/docs` 更直接。
 
-- 情绪识别：前端 `upload_frame`（约 2.5fps 抽帧）→ 后端返回 `emotion_result`；
-- 视频通话：`vc_start` / `vc_stop` / `vc_audio_chunk` / `vc_audio_end` / `vc_interrupt` /
-  `vc_update_frame` / `vc_update_emotion` / `vc_clear_history` → 后端返回
-  `vc_state_change`、`vc_llm_token/done`、`vc_tts_start/chunk/done`、`vc_vlm_result` 等。
+上述接口与 SocketIO 连接都要求登录态（`Authorization: Bearer <accessToken>` /
+`auth.token`），未登录会被拒绝。
+
+SocketIO 事件（下表按前端实际收发整理）：
+
+| 方向 | 事件 |
+| --- | --- |
+| 前端 → 后端 | 情绪识别抽帧：`upload_frame` |
+| 前端 → 后端 | 通话控制：`vc_start` / `vc_stop` / `vc_interrupt` / `vc_clear_history` |
+| 前端 → 后端 | 音频与画面：`vc_audio_end`（携带 `file_id`）/ `vc_update_frame` / `vc_update_emotion` |
+| 前端 → 后端 | 授权范围：`vc_consent` |
+| 后端 → 前端 | 情绪识别：`emotion_result` |
+| 后端 → 前端 | 通话状态与语音：`vc_state_change` / `vc_asr_result` / `vc_emotion_analysis` |
+| 后端 → 前端 | 生成与播报：`vc_llm_token` / `vc_llm_done` / `vc_tts_start` / `vc_tts_chunk` / `vc_tts_done` |
+| 后端 → 前端 | 会话与授权：`vc_conversation_ready` / `vc_consent_updated` |
+| 后端 → 前端 | 中断与异常：`vc_interrupted` / `vc_idle_timeout` / `vc_error` |
+| 后端 → 前端 | 可选视觉理解：`vc_vlm_result` |
+
+> 后端还会发出 `vc_session_started` 与 `vc_crisis_alert`，但前端目前没有监听这两个事件
+> （风险提示走的是管理后台的危机处理页）。如果要在通话页直接提示风险，需要补上监听。
 
 ### 使用前提
 
 - 后端已通过 `app.main:socket_app` 启动（`/socket.io` 可用）；
 - AI 模型已加载（后端 `config_check` 显示 loaded；未加载时先调 warmup）；
 - AI 教练需要后端 `.env` 配置 `DEEPSEEK_API_KEY`，否则返回 503；
+- 需要登录态：AI 实验室接口与 SocketIO 连接均校验 JWT；
 - 浏览器需允许摄像头/麦克风权限（HTTPS 或 localhost 环境）。
 
 ## 页面功能

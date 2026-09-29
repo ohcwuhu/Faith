@@ -1,11 +1,16 @@
-# MindBasic 后端服务
+# Faith 后端服务
 
-心理教练成长服务平台（MindBasic）的 FastAPI 后端。为响应式 Web 前端提供 REST API，
-覆盖用户端自助工具、教练端工作台、管理后台，以及内嵌的 **AI 实验室**（实时表情识别、
-多模态情绪分析、DeepSeek AI 心理教练）。
+Faith 心理教练成长服务平台的 FastAPI 后端。为响应式 Web 前端提供 REST API，
+覆盖用户端自助工具、教练端工作台、管理后台，以及 **AI 实验室**（实时表情识别、
+多模态情绪分析、AI 心理教练）。
 
-相关项目：前端仓库 `MindBasic-frontend`（开发地址 `http://127.0.0.1:5173`），
-AI 实验室页面为 `/ai-chat`（豆包式对话）与 `/video-call`（AI 视频通话）。
+本目录是 monorepo `Faith` 的后端部分，前端在同仓库的 `MindBasic-frontend/`
+（开发地址 `http://127.0.0.1:5173`）；仓库整体说明见 [根 README](../README.md)。
+
+AI 实验室的页面入口是前端的 `/self-coaching`（AI 视频通话，配合
+`POST /api/vc_audio_upload` 与 `vc_*` SocketIO 事件）；`/video-call` 只是重定向到
+`/self-coaching` 的旧路径。文字教练接口 `POST /api/ai_coach/chat` 没有对应页面，
+供脚本与联调使用。
 
 ## 技术栈
 
@@ -22,7 +27,7 @@ AI 实验室页面为 `/ai-chat`（豆包式对话）与 `/video-call`（AI 视�
 | 邮件 | smtplib | 邮箱验证码（登录/找回密码/绑定邮箱），465 SSL / 587 STARTTLS |
 | AI 实验室 | funasr / opensmile / deepface / torch / tensorflow | 语音转写、语调情感、表情识别、融合分析 |
 | AI 教练 | DeepSeek Chat API | 以识别结果为上下文做心理教练式引导 |
-| 测试 | pytest | 集成测试直连开发库，80 项覆盖核心链路 |
+| 测试 | pytest | 集成测试直连开发库，39 个文件 / 215 项覆盖核心链路 |
 
 ## 架构总览
 
@@ -58,7 +63,7 @@ conda create -n relmind-backend python=3.12 -y
 conda activate relmind-backend
 
 # 2. 安装依赖（含锁定版本）
-cd backend
+cd MindBasic-backend
 pip install -r requirements.txt
 # 复现锁定版本：pip install -r requirements.lock
 # 说明：socketio / requests / jieba 属于核心运行时依赖（已列在 requirements.txt），
@@ -112,26 +117,37 @@ pytest tests -q
 | --- | --- | --- |
 | `DATABASE_URL` | 是 | `mysql+pymysql://用户:密码@主机:3306/mindbasic?charset=utf8mb4`，密码含特殊字符需 URL 编码 |
 | `JWT_SECRET_KEY` | 是 | 随机 64 位 hex，缺失或占位值启动失败 |
+| `APP_NAME` | 否 | 应用名，默认 `MindBasic` |
+| `DEBUG` | 否 | 默认 false；true 时放宽配置校验并输出更详细日志。**生产必须为 false** |
+| `JWT_ALGORITHM` | 否 | 默认 `HS256` |
+| `LOG_LEVEL` | 否 | 默认 `INFO` |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | 否 | Access Token 有效期，默认 120 |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | 否 | Refresh Token 有效期，默认 14 |
 | `COOKIE_SECURE` | 否 | 生产（DEBUG=false）强制 true |
 | `CORS_ORIGINS` | 否 | 生产环境需显式配置前端域名 |
 | `RATE_LIMIT_BACKEND` | 否 | `memory`（单实例）/ `redis`（多实例，需 `REDIS_URL`） |
 | `REDIS_URL` | 否 | Redis 连接串，限流/黑名单/缓存切 Redis 时使用 |
+| `SCHEDULER_ENABLED` | 否 | 是否启动定时任务（订单超时释放 / 导出清理 / 孤儿文件扫描 / 空闲通话扫描），默认 true；测试环境建议置 false |
 | `EMAIL_ENABLED` | 否 | false 时验证码打印在后端日志，方便开发联调 |
 | `SMTP_HOST/PORT/USER/PASSWORD/FROM` | 否 | 邮箱发送；QQ/163 用 465（SSL），STARTTLS 服务用 587 |
-| `DEEPSEEK_API_KEY` | 否 | DeepSeek Key，AI 心理教练；未配置时 `/api/ai_coach/chat` 返回 503 |
+| `EMAIL_CODE_TTL_MINUTES` | 否 | 邮箱验证码有效期（分钟），默认 10 |
+| `DEEPSEEK_API_KEY` | 否 | DeepSeek Key。视频通话在 Dify 不可用时回退到它；未配置时 `/api/ai_coach/chat` 返回 503，视频通话也没有可用 LLM |
 | `DIFY_API_BASE` / `DIFY_API_KEY` | 否 | Dify 智能体（视频通话 LLM）；Key 必须是**应用密钥**（`app-` 开头，`dataset-` 开头的是知识库密钥，调不通 `/chat-messages`）。配置后**优先走 Dify**（云端 `https://api.dify.ai/v1`，本地 Docker 用 `http://<host>:18080/v1`），失败时按「单轮回退 + 熔断」降级到 DeepSeek（详见下文「LLM 供应商选择与回退」）。自检：`python scripts/check_dify.py` |
 | `LLM_RETRIES` | 否 | LLM 请求连接失败自动重试次数，默认 3（应对 SSL EOF / 超时等瞬时故障） |
 | `DIFY_CIRCUIT_THRESHOLD` / `DIFY_CIRCUIT_COOLDOWN` | 否 | Dify 熔断阈值：连续失败几轮后跳过 Dify（默认 3 轮）、跳过时长（默认 120 秒）。冷却结束自动再试，任一成功即复位 |
+| `DIFY_TIMEOUT` | 否 | Dify 请求超时（秒），默认 90 |
 | `KB_RERANK_ENABLED` | 否 | 知识库检索是否用 DeepSeek 做查询扩展 + 重排，默认 true；设为 false 退回纯 BM25（省两次模型调用） |
 | `KB_RECALL_CANDIDATES` | 否 | BM25 召回的候选条数（交给 DeepSeek 重排），默认 12 |
+| `KB_LLM_TIMEOUT` | 否 | 知识库重排阶段的 LLM 超时（秒），默认 20 |
 | `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` | 否 | 建索引时的切块长度 / 重叠字数，默认 500 / 100（改后需重建索引） |
 | `KB_SOURCE_DIR` / `KB_INDEX_PATH` | 否 | 覆盖语料源目录 / 索引路径（默认位置见「知识库上传与部署指南」） |
 | `SENSEVOICE_DEVICE` | 否 | SenseVoice 设备，留空自动检测（`cuda`/`cpu`） |
+| `RELMIND_SENSEVOICE_TIMEOUT` / `RELMIND_OPENSMILE_TIMEOUT` | 否 | 推理单次超时（秒），默认 600 / 300 |
 | `DEEPSEEK_BASE_URL/MODEL/TIMEOUT` | 否 | DeepSeek 覆盖项（默认 api.deepseek.com / deepseek-chat / 90s） |
-| `TTS_VOICE` / `TTS_RATE` | 否 | 视频通话语音合成（edge-tts，免费）；默认 `zh-CN-XiaoxiaoNeural` / `+20%` |
+| `TTS_VOICE` / `TTS_RATE` | 否 | 视频通话语音合成（edge-tts，免费）。代码默认 `zh-CN-XiaoxiaoNeural` / `+20%`，而 `.env.example` 模板给的是 `+0%`（更接近自然语速），按需调整 |
 | `VLM_API_KEY` / `VLM_BASE_URL` / `VLM_MODEL` | 否 | 视频通话视觉理解（OpenAI 兼容 Vision API）；未配置时跳过视觉理解 |
+| `VC_IDLE_TIMEOUT_SECONDS` | 否 | 服务端空闲通话兜底超时（秒），默认 300，每 60 秒扫描一次；用于覆盖标签页被挂起、前端定时器被浏览器节流的情况（前端自身的 15s/45s/75s 逻辑见前端 README） |
+| `FUSION_CALIBRATION_ENABLED` / `FUSION_TEMPERATURE` / `FUSION_CALIBRATION_SOURCE` | 否 | 多模态融合的置信度温度缩放。默认关闭；温度必须来自真实标注数据（`experiments/run_calibration.py`），禁止直接填合成数据上的拟合值 |
 | `CHAT_FREE_REPLY_LIMIT` | 否 | 免费沟通教练回复条数，默认 3 |
 | `PAYMENT_MODE` | 否 | `mock`（余额/模拟支付，默认）/ `disabled` |
 | `ORDER_PAY_TIMEOUT_MIN` | 否 | 预约订单支付时限（分钟），默认 15，超时释放时段 |
@@ -178,9 +194,10 @@ backend/
 ├── scripts/
 │   ├── run_dev.py               # 开发启动（app.main:socket_app）
 │   ├── demo_seed.py             # 演示数据
-│   ├── cleanup_orphan_files.py  # 清扫上传孤儿文件（支持 --dry-run）
 │   ├── build_kb_index.py        # 构建知识库检索索引（本地，不调模型 API）
-│   └── check_dify.py            # Dify 接入自检（入参 / 类型 / 一轮完整对话）
+│   ├── check_dify.py            # Dify 接入自检（入参 / 类型 / 一轮完整对话）
+│   ├── cleanup_orphan_files.py  # 清扫上传孤儿文件（支持 --dry-run）
+│   └── backup.sh                # 备份数据库 + uploads + exports（建议 cron 每日执行）
 ├── data/                   # 知识库索引 kb_index.pkl（构建产物，不入库）
 ├── tests/                  # pytest 集成测试（39 个文件，215 项）
 ├── experiments/            # 评测脚本与标注数据（消融 / 危机分级 / 校准 / 阶段一致性）
@@ -365,6 +382,7 @@ AI 心理教练对话。请求：
 | `connect` / `disconnect` | 双向 | 建立/断开连接，自动维护 per-sid 状态 |
 | `upload_frame` | 前端 → 后端 | `{ imgBase64 }` 画面帧（节流 0.4s） |
 | `emotion_result` | 后端 → 前端 | `{ timestamp, score, level, students, alert, emotions, processing_time_ms }` |
+| `psych_result` | 后端 → 前端 | 心理状态评估结果（在 `emotion_result` 之外单独下发） |
 | `emotion_error` | 后端 → 前端 | `{ error, message }` |
 | `upload_audio` | 前端 → 后端 | 预留事件（当前仅记录日志） |
 
@@ -377,14 +395,20 @@ AI 心理教练对话。请求：
 | `vc_interrupt` | 前端 → 后端 | 用户打断（停止后续 TTS，不中断 LLM 生成） |
 | `vc_update_frame` / `vc_update_emotion` | 前端 → 后端 | 更新 VLM 画面帧 / 情绪上下文 |
 | `vc_clear_history` | 前端 → 后端 | 清空会话对话历史 |
+| `vc_consent` | 前端 → 后端 | 上报麦克风 / 摄像头 / 多模态授权范围（写入 `consent_records`） |
 | `vc_state_change` | 后端 → 前端 | 状态切换（listening/thinking/speaking/idle） |
 | `vc_asr_result` / `vc_emotion_analysis` | 后端 → 前端 | 语音转写结果 / 情绪分析结果 |
 | `vc_llm_token` / `vc_llm_done` | 后端 → 前端 | LLM 流式 token / 完成 |
 | `vc_tts_start` / `vc_tts_chunk` / `vc_tts_done` | 后端 → 前端 | TTS 语音分句合成进度 |
 | `vc_vlm_result` | 后端 → 前端 | 视觉理解结果 |
 | `vc_session_started` / `vc_conversation_ready` | 后端 → 前端 | 会话已入库（`sessionId` / `conversationId`，用于通话结束后生成日记） |
+| `vc_consent_updated` | 后端 → 前端 | 授权范围变更确认 |
 | `vc_crisis_alert` | 后端 → 前端 | 风险提示（`{ level, levelLabel, riskScore, reasons, hotline }`） |
+| `vc_idle_timeout` | 后端 → 前端 | 服务端空闲兜底超时（`VC_IDLE_TIMEOUT_SECONDS`）触发，通知前端收尾 |
 | `vc_interrupted` / `vc_error` | 后端 → 前端 | 打断确认 / 错误 |
+
+> 前端目前只监听其中一部分：`vc_session_started`、`vc_crisis_alert`、`psych_result`
+> 后端会发出，但前端尚未消费（风险提示目前走管理后台的危机处理页）。
 
 ## 危机风险分级与响应
 
@@ -503,15 +527,15 @@ AI 心理教练对话。请求：
 ## 测试
 
 ```bash
-cd backend
-pytest tests -q                    # 全量 180 项（其中约 100 项需要可连接的 MySQL）
+cd MindBasic-backend
+pytest tests -q                    # 全量 215 项（其中约 100 项需要可连接的 MySQL）
 pytest tests/test_auth.py -q       # 单模块
 ```
 
 ### 评测（多模态融合与危机分级）
 
 ```bash
-cd backend
+cd MindBasic-backend
 python experiments/run_fusion_ablation.py   # 单模态/固定权重/动态权重消融
 python experiments/run_crisis_eval.py       # 危机分级准确率、漏报率、误报率
 python experiments/run_calibration.py       # 置信度校准（温度缩放），产出 FUSION_TEMPERATURE

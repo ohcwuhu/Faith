@@ -1,0 +1,212 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { PhChatCircleDots as ChatDots, PhWarningCircle as WarningCircle } from '@phosphor-icons/vue'
+import { get, post } from '@/api/client'
+import type { PublicPlatformConfig } from '@/api/types'
+import VideoCallPanel from '@/components/ai-lab/VideoCallPanel.vue'
+
+const AI_ACK_KEY = 'mb_ai_ack_v1'
+
+const router = useRouter()
+const platform = ref<PublicPlatformConfig | null>(null)
+const showAck = ref(false)
+const endedConv = ref<number | null>(null)
+const summarizing = ref(false)
+const dialogError = ref('')
+
+onMounted(async () => {
+  try {
+    platform.value = await get<PublicPlatformConfig>('/platform/config')
+  } catch {
+    platform.value = null
+  }
+  showAck.value = !localStorage.getItem(AI_ACK_KEY)
+})
+
+function ack() {
+  try {
+    localStorage.setItem(AI_ACK_KEY, '1')
+  } catch {
+    /* ignore */
+  }
+  showAck.value = false
+}
+
+function askJournal(conversationId: number) {
+  endedConv.value = conversationId
+  dialogError.value = ''
+}
+
+async function confirmJournal() {
+  const cid = endedConv.value
+  if (!cid || summarizing.value) return
+  summarizing.value = true
+  dialogError.value = ''
+  try {
+    const draft = await post<{ moodType: string; content: string; conversationId: number }>(
+      `/ai-conversations/${cid}/summary`,
+    )
+    endedConv.value = null
+    router.push({
+      path: '/emotion-journal',
+      query: { mood: draft.moodType, content: draft.content, conversationId: String(draft.conversationId) },
+    })
+  } catch (e) {
+    dialogError.value = e instanceof Error ? e.message : '总结失败，请稍后重试'
+  } finally {
+    summarizing.value = false
+  }
+}
+</script>
+
+<template>
+  <div class="video-call-page">
+    <div class="flex justify-end shrink-0">
+      <RouterLink
+        to="/self-coaching/history"
+        class="inline-flex items-center gap-1.5 text-sm text-ink-soft hover:text-pine pressable"
+      >
+        <ChatDots :size="16" weight="duotone" />
+        历史记录
+      </RouterLink>
+    </div>
+
+    <div v-if="platform?.aiDisclaimer" class="ai-banner">
+      <span class="ai-badge">AI 生成</span>
+      <span class="ai-text">{{ platform.aiDisclaimer }}</span>
+    </div>
+
+    <div class="panel-wrap">
+      <VideoCallPanel @conversation-ended="askJournal" />
+    </div>
+
+    <Teleport to="body">
+      <div
+        v-if="endedConv !== null"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4"
+        role="dialog"
+        aria-modal="true"
+        aria-label="记录到情绪日记"
+      >
+        <div class="absolute inset-0 bg-ink/40" @click="endedConv = null"></div>
+        <div class="relative w-full max-w-[380px] bg-card rounded-[14px] border border-hairline p-6">
+          <h2 class="text-lg font-semibold tracking-tight">记录到情绪日记？</h2>
+          <p class="mt-2 text-sm text-ink-soft leading-relaxed">
+            是否将本次自我教练对话总结后加入情绪日记？总结会自动填好，你可以修改后再提交。
+          </p>
+          <p v-if="dialogError" class="mt-3 text-sm text-red-800 bg-red-50 border border-red-200 rounded-[10px] px-4 py-3">
+            {{ dialogError }}
+          </p>
+          <div class="mt-6 flex justify-end gap-2">
+            <button
+              type="button"
+              class="h-10 px-5 rounded-full border border-hairline bg-card text-sm text-ink-soft pressable"
+              :disabled="summarizing"
+              @click="endedConv = null"
+            >
+              暂不记录
+            </button>
+            <button
+              type="button"
+              class="h-10 px-5 rounded-full bg-pine text-card text-sm font-medium pressable disabled:opacity-50"
+              :disabled="summarizing"
+              @click="confirmJournal"
+            >
+              {{ summarizing ? '总结中…' : '记录到日记' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="showAck"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4"
+        role="dialog"
+        aria-modal="true"
+        aria-label="AI 自我教练说明"
+      >
+        <div class="absolute inset-0 bg-ink/40" @click="ack"></div>
+        <div class="relative w-full max-w-[420px] bg-card rounded-[14px] border border-hairline p-6">
+          <span class="w-11 h-11 rounded-full bg-pine-soft text-pine flex items-center justify-center">
+            <WarningCircle :size="22" weight="duotone" />
+          </span>
+          <h2 class="mt-3 text-lg font-semibold tracking-tight">AI 自我教练说明</h2>
+          <p class="mt-2 text-sm text-ink-soft leading-relaxed">
+            本功能由人工智能生成回复，非人工心理服务，内容仅供参考，不提供诊断或治疗。
+          </p>
+          <p class="mt-2 text-sm text-ink-soft leading-relaxed">
+            如处于心理危机或紧急状态，请立即拨打心理援助热线
+            <span class="font-semibold text-pine">{{ platform?.hotline ?? '12356' }}</span>
+            或前往就近医疗机构。
+          </p>
+          <RouterLink to="/terms" class="mt-3 inline-block text-sm text-pine underline underline-offset-2">
+            查看《服务协议与免责声明》
+          </RouterLink>
+          <div class="mt-6 flex justify-end">
+            <button
+              type="button"
+              class="h-11 px-6 rounded-full bg-pine text-card text-sm font-medium pressable"
+              @click="ack"
+            >
+              我已知晓，开始使用
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+  </div>
+</template>
+
+<style scoped>
+.video-call-page {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 64px;
+  bottom: 0;
+  background: var(--color-paper);
+  padding: 16px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ai-banner {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--color-card);
+  border: 1px solid var(--color-hairline);
+  border-radius: 10px;
+}
+.ai-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--color-pine-deep);
+  background: var(--color-pine-soft);
+  border-radius: 999px;
+  padding: 3px 8px;
+}
+.ai-text {
+  font-size: 12px;
+  color: var(--color-ink-soft);
+  line-height: 1.5;
+}
+.panel-wrap {
+  flex: 1;
+  min-height: 0;
+}
+@media (max-width: 640px) {
+  .video-call-page {
+    top: 56px;
+    bottom: 64px;
+    padding: 10px;
+  }
+}
+</style>
